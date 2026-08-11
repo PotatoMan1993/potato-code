@@ -60,9 +60,9 @@ class ChatTextArea(TextArea):
             return
         await super()._on_key(event)
 
-    def action_quit(self) -> None:
+    async def action_quit(self) -> None:
         """Ctrl+C：委托给 App 的安全退出（取消进行中的流）。"""
-        self.app.action_quit()
+        await self.app.action_quit()
 
 
 class PotatoCodeApp(StreamMixin, App):
@@ -105,7 +105,6 @@ class PotatoCodeApp(StreamMixin, App):
     }
     #select-screen {
         height: auto;
-        max-height: 70%;
         margin: 2 4;
         display: none;
     }
@@ -115,7 +114,6 @@ class PotatoCodeApp(StreamMixin, App):
     }
     #select {
         height: auto;
-        max-height: 50%;
         border: round $accent;
     }
     #statusbar {
@@ -212,7 +210,7 @@ class PotatoCodeApp(StreamMixin, App):
         input_box = self.query_one(ChatTextArea)
 
         if text == "/exit":
-            self.action_quit()
+            await self.action_quit()
             return
         if not text:
             input_box.clear()
@@ -233,7 +231,7 @@ class PotatoCodeApp(StreamMixin, App):
 
     # ────────────────────── 退出 ──────────────────────
 
-    def action_quit(self) -> None:
+    async def action_quit(self) -> None:
         """安全退出：先取消进行中的流式 task，再退出应用（还原终端）。"""
         if self._stream_task is not None and not self._stream_task.done():
             self._stream_task.cancel()

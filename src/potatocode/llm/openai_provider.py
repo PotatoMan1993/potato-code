@@ -12,12 +12,20 @@ from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 
 import openai
+from openai.types.chat import ChatCompletion, ChatCompletionMessageParam
 
 from ..prompt import SYSTEM_PROMPT
 from . import Message, StreamEvent
 
 if TYPE_CHECKING:
     from ..config import ProviderConfig
+
+
+def _to_param(m: Message) -> ChatCompletionMessageParam:
+    """把统一 Message 转为 openai SDK 的消息参数（窄化 role 字面量）。"""
+    if m.role == "user":
+        return {"role": "user", "content": m.content}
+    return {"role": "assistant", "content": m.content}
 
 
 class OpenAIProvider:
@@ -43,8 +51,8 @@ class OpenAIProvider:
     async def stream(self, msgs: list[Message]) -> AsyncIterator[StreamEvent]:
         """发起一轮流式对话，以 async generator 吐出 StreamEvent。"""
         # 首条注入内置 system prompt，其后是完整多轮历史
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        messages += [{"role": m.role, "content": m.content} for m in msgs]
+        messages: list[ChatCompletionMessageParam] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages += [_to_param(m) for m in msgs]
 
         try:
             stream = await self._client.chat.completions.create(
@@ -52,6 +60,8 @@ class OpenAIProvider:
                 messages=messages,
                 stream=True,
             )
+            # stream=True 时 SDK 返回 AsyncStream[ChatCompletionChunk]（收窄联合类型）
+            assert not isinstance(stream, ChatCompletion)
             async for chunk in stream:
                 # 个别 chunk（如仅含 usage）可能没有 choices
                 if not chunk.choices:
