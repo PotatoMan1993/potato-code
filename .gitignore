@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# 测试/工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# PotatoCode 运行配置（含真实密钥，N5）
+.potatocode/config.yaml
