@@ -58,10 +58,7 @@ class AnthropicProvider:
             async with self._client.messages.stream(**params) as stream:
                 async for event in stream:
                     # 只取正文文本增量；thinking_delta 与其他事件一律丢弃
-                    if (
-                        event.type == "content_block_delta"
-                        and event.delta.type == "text_delta"
-                    ):
+                    if event.type == "content_block_delta" and event.delta.type == "text_delta":
                         yield StreamEvent(text=event.delta.text)
             yield StreamEvent(done=True)
         except asyncio.CancelledError:

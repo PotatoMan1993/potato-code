@@ -82,9 +82,7 @@ def _parse_provider(item: object, index: int) -> ProviderConfig:
     model = _require_str(item, "model", prefix)
 
     if protocol not in _PROTOCOLS:
-        raise ConfigError(
-            f"{prefix}.protocol 非法: {protocol!r}（应为 'anthropic' 或 'openai'）"
-        )
+        raise ConfigError(f"{prefix}.protocol 非法: {protocol!r}（应为 'anthropic' 或 'openai'）")
 
     # 可选字段
     base_url = item.get("base_url")
