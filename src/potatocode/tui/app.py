@@ -77,31 +77,43 @@ class PotatoCodeApp(StreamMixin, App):
     CSS = """
     #chat {
         height: 1fr;
+        width: 1fr;
     }
     #log {
         height: 1fr;
+        width: 1fr;
     }
     #streaming {
         height: auto;
         max-height: 60%;
         padding: 0 2;
         display: none;
+        width: 1fr;
     }
     #input-row {
         height: auto;
         max-height: 12;
-        margin: 0 1;
+        # margin: 0 1;
+        width: 1fr;
+        background: $surface;
     }
     #prompt {
-        width: 2;
-        color: $accent;
         text-style: bold;
-        padding: 1 0 0 1;
+        border: round $accent;
+        border-left: none;
+        border-right: none;
+        height: auto;
+        max-height: 10;
+        width: 2;
+        # color: $accent;
     }
     #input {
         border: round $accent;
+        border-left: none;
+        border-right: none;
         height: auto;
         max-height: 10;
+        width: 1fr;
     }
     #select-screen {
         height: auto;
@@ -146,7 +158,7 @@ class PotatoCodeApp(StreamMixin, App):
             yield RichLog(id="log", wrap=True, auto_scroll=True)
             yield Static(id="streaming")
             with Horizontal(id="input-row"):
-                yield Static("❯", id="prompt")
+                yield Static(">", id="prompt")
                 yield ChatTextArea(
                     id="input",
                     placeholder="Send a message...",

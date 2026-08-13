@@ -32,15 +32,15 @@ def statusbar_content(name: str | None, model: str | None) -> RenderableType:
 
 def user_block(text: str) -> RenderableType:
     """用户输入块（提交定型后追加到对话区）。"""
-    return Group(Text(""), Text(f"● {text}", style="bold green"))
+    return Group(Text(""), Text(f"> {text}", style="bold magenta"))
 
 
 def assistant_block(reply: str, elapsed: float) -> RenderableType:
     """助手回复块：markdown 定型渲染 + 本轮总耗时。"""
+    reply = "● " + reply
     body: RenderableType = Markdown(reply) if reply.strip() else Text("（空回复）", style="dim")
     return Group(
         Text(""),
-        Text("●", style="bold magenta"),
         body,
         Text(f"⏱ {elapsed:.1f}s", style="dim"),
     )
