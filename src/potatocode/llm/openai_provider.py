@@ -1,7 +1,9 @@
-"""openai 适配器：封装 AsyncOpenAI chat.completions，统一吐出文本增量。
+"""openai 适配器：封装 AsyncOpenAI chat.completions，统一吐出文本增量与工具调用。
 
 - 内置 system prompt 作为首条 system 消息注入；
+- tools 非空时随请求注入工具定义（F3）；
 - thinking 配置在 openai 协议下忽略；
+- 流式按 index 累加 tool_calls 分片，组装完整工具调用（F4）；
 - 正常结束 yield done 事件，异常 yield err 事件（不抛出给上层）。
 """
 
@@ -9,23 +11,63 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import openai
 from openai.types.chat import ChatCompletion, ChatCompletionMessageParam
 
 from ..prompt import SYSTEM_PROMPT
-from . import Message, StreamEvent
+from . import Message, StreamEvent, ToolCall, ToolDefinition
 
 if TYPE_CHECKING:
     from ..config import ProviderConfig
 
 
-def _to_param(m: Message) -> ChatCompletionMessageParam:
-    """把统一 Message 转为 openai SDK 的消息参数（窄化 role 字面量）。"""
+def _to_openai_tools(tools: list[ToolDefinition]) -> list[dict[str, object]]:
+    """把协议无关工具定义转为 openai 的 tools 请求参数（F3/AC1）。"""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.input_schema,
+            },
+        }
+        for t in tools
+    ]
+
+
+def _to_params(m: Message) -> list[ChatCompletionMessageParam]:
+    """把统一 Message 转为 openai 消息参数列表。
+
+    assistant 工具调用回合 → 一条带 tool_calls 的 assistant 消息；
+    tool 结果回合 → 每个结果各一条 tool 消息。
+    """
     if m.role == "user":
-        return {"role": "user", "content": m.content}
-    return {"role": "assistant", "content": m.content}
+        return [{"role": "user", "content": m.content}]
+    if m.role == "assistant":
+        if m.tool_calls:
+            return [
+                {
+                    "role": "assistant",
+                    "content": m.content or None,
+                    "tool_calls": [
+                        {
+                            "id": c.id,
+                            "type": "function",
+                            "function": {"name": c.name, "arguments": c.input or "{}"},
+                        }
+                        for c in m.tool_calls
+                    ],
+                }
+            ]
+        return [{"role": "assistant", "content": m.content}]
+    # tool 角色：每个结果独立成一条 tool 消息
+    return [
+        {"role": "tool", "tool_call_id": r.tool_call_id, "content": r.content}
+        for r in m.tool_results
+    ]
 
 
 class OpenAIProvider:
@@ -48,27 +90,63 @@ class OpenAIProvider:
     def model(self) -> str:
         return self._model
 
-    async def stream(self, msgs: list[Message]) -> AsyncIterator[StreamEvent]:
+    async def stream(
+        self,
+        msgs: list[Message],
+        tools: list[ToolDefinition],
+    ) -> AsyncIterator[StreamEvent]:
         """发起一轮流式对话，以 async generator 吐出 StreamEvent。"""
         # 首条注入内置 system prompt，其后是完整多轮历史
         messages: list[ChatCompletionMessageParam] = [{"role": "system", "content": SYSTEM_PROMPT}]
-        messages += [_to_param(m) for m in msgs]
+        for m in msgs:
+            messages.extend(_to_params(m))
+
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "messages": messages,
+            "stream": True,
+        }
+        if tools:
+            kwargs["tools"] = _to_openai_tools(tools)
 
         try:
-            stream = await self._client.chat.completions.create(
-                model=self._model,
-                messages=messages,
-                stream=True,
-            )
+            stream = await self._client.chat.completions.create(**kwargs)
             # stream=True 时 SDK 返回 AsyncStream[ChatCompletionChunk]（收窄联合类型）
             assert not isinstance(stream, ChatCompletion)
+
+            # 按 index 累加 tool_calls 分片（多工具下同时分片，须拼齐参数）
+            tool_calls_buf: dict[int, dict[str, str]] = {}
             async for chunk in stream:
                 # 个别 chunk（如仅含 usage）可能没有 choices
                 if not chunk.choices:
                     continue
-                delta = chunk.choices[0].delta.content
-                if delta:
-                    yield StreamEvent(text=delta)
+                choice = chunk.choices[0]
+                delta = choice.delta
+                if delta.content:
+                    yield StreamEvent(text=delta.content)
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        if tc.index is None:
+                            continue
+                        buf = tool_calls_buf.setdefault(tc.index, {})
+                        if tc.id:
+                            buf["id"] = tc.id
+                        if tc.function and tc.function.name:
+                            buf["name"] = tc.function.name
+                        if tc.function and tc.function.arguments:
+                            buf["args"] = buf.get("args", "") + tc.function.arguments
+
+            if tool_calls_buf:
+                # 空 arguments（无参工具）归一为 "{}"，避免回灌时报参数非法
+                calls = [
+                    ToolCall(
+                        id=v.get("id", ""),
+                        name=v.get("name", ""),
+                        input=v.get("args") or "{}",
+                    )
+                    for _, v in sorted(tool_calls_buf.items())
+                ]
+                yield StreamEvent(tool_calls=calls)
             yield StreamEvent(done=True)
         except asyncio.CancelledError:
             raise  # 调用方 cancel 时正常终止

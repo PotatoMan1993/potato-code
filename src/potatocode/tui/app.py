@@ -15,14 +15,14 @@ from textual.message import Message
 from textual.timer import Timer
 from textual.widgets import RichLog, Static, TextArea
 
-from .. import __version__
 from ..config import ProviderConfig
 from ..conversation import Conversation
 from ..llm import Provider, new_provider
 from ..prompt import render_banner
+from ..tool import Registry
 from .select import ProviderSelect
 from .stream import StreamMixin
-from .view import SessionState, statusbar_content, user_block
+from .view import SessionState, ToolDisplay, statusbar_content, user_block
 
 
 class ChatSubmitted(Message):
@@ -140,14 +140,18 @@ class PotatoCodeApp(StreamMixin, App):
         Binding("ctrl+c", "quit", "Quit"),
     ]
 
-    def __init__(self, providers: list[ProviderConfig]) -> None:
+    def __init__(self, providers: list[ProviderConfig], version: str, registry: Registry) -> None:
         super().__init__()
         self.providers = providers
+        self._version = version
+        # 注意：不能用 `_registry`——Textual App 内部已占用该名字（AppRegistry）
+        self._tool_registry = registry
         self.provider: Provider | None = None
         self.conv = Conversation()
         self.state = SessionState.IDLE
         self.cur_reply = ""
         self.turn_start = 0.0
+        self._cur_tool: ToolDisplay | None = None  # 执行中工具指示（F8/N2）
         self._stream_task: asyncio.Task | None = None
         self._timer: Timer | None = None
 
@@ -172,7 +176,7 @@ class PotatoCodeApp(StreamMixin, App):
     def on_mount(self) -> None:
         """启动：写 banner；单 provider 直进对话，多 provider 进选择界面。"""
         log = self.query_one("#log", RichLog)
-        log.write(Text(render_banner(__version__, os.getcwd()), style="cyan"))
+        log.write(Text(render_banner(self._version, os.getcwd()), style="cyan"))
         self._update_statusbar()
 
         if len(self.providers) == 1:
@@ -238,7 +242,7 @@ class PotatoCodeApp(StreamMixin, App):
         self.turn_start = time.monotonic()
         self.state = SessionState.STREAMING
         self._refresh_streaming_view()
-        self._stream_task = asyncio.create_task(self._consume_stream())
+        self._stream_task = asyncio.create_task(self._consume_agent_events())
         self._timer = self.set_interval(0.1, self._tick)
 
     # ────────────────────── 退出 ──────────────────────

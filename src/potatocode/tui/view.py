@@ -1,13 +1,17 @@
-"""TUI 视图层：各状态的渲染拼装——状态栏、用户块、markdown 定型、错误样式。"""
+"""TUI 视图层：各状态的渲染拼装——状态栏、用户块、markdown 定型、工具行、错误样式。"""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
 
 from rich.console import Group, RenderableType
 from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
+
+# 结果摘要在界面上的行数上限（N5：与回灌给模型的截断相互独立）
+_RESULT_SUMMARY_LINES = 8
 
 
 class SessionState(Enum):
@@ -16,6 +20,14 @@ class SessionState(Enum):
     SELECTING = "selecting"  # 多 provider 时的选择界面
     IDLE = "idle"  # 等待用户输入
     STREAMING = "streaming"  # 等待/接收模型流（loading + 计时）
+
+
+@dataclass
+class ToolDisplay:
+    """进行中的工具调用展示信息（渲染执行指示用）。"""
+
+    name: str
+    args: str
 
 
 def statusbar_content(name: str | None, model: str | None) -> RenderableType:
@@ -44,6 +56,35 @@ def assistant_block(reply: str, elapsed: float) -> RenderableType:
         body,
         Text(f"⏱ {elapsed:.1f}s", style="dim"),
     )
+
+
+def preamble_block(text: str) -> RenderableType:
+    """工具调用前的助手文本（preamble）：markdown 定型，不带耗时行。"""
+    if not text.strip():
+        return Text("")
+    return Markdown("● " + text)
+
+
+def tool_line(name: str, args: str) -> RenderableType:
+    """工具行：`● name(args)`，Claude Code 风格（F8/AC11）。"""
+    line = Text()
+    line.append("● ", style="bold cyan")
+    line.append(f"{name}({args})", style="bold")
+    return line
+
+
+def tool_result_summary(result: str, is_error: bool) -> RenderableType:
+    """工具结果摘要：每行 `⎿ ` 前缀，灰/红样式，界面截断 ~8 行（F8/N5）。"""
+    style = "bold red" if is_error else "dim"
+    if not result.strip():
+        body = Text("  ⎿ （无输出）", style=style)
+    else:
+        lines = result.splitlines()
+        shown = lines[:_RESULT_SUMMARY_LINES]
+        if len(lines) > _RESULT_SUMMARY_LINES:
+            shown = shown + ["…"]
+        body = Text("\n".join(f"  ⎿ {ln}" for ln in shown), style=style)
+    return body
 
 
 def error_block(err: Exception) -> RenderableType:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from potatocode.conversation import Conversation
+from potatocode.llm import ToolCall, ToolResult
 
 
 def test_empty_at_start():
@@ -26,6 +27,30 @@ def test_multi_turn_order_and_roles():
         "我叫小明",
         "好的，小明。",
     ]
+
+
+def test_tool_turn_sequence():
+    """工具调用回合 + 工具结果回合按序落地，内容正确（F6）。"""
+    conv = Conversation()
+    conv.add_user("读一下配置文件")
+    conv.add_assistant_with_tool_calls(
+        "我来读取。",
+        [ToolCall(id="call_1", name="read_file", input='{"path": "pyproject.toml"}')],
+    )
+    conv.add_tool_results([ToolResult(tool_call_id="call_1", content="已读取，内容如下")])
+    conv.add_assistant("配置已就绪。")
+
+    msgs = conv.messages()
+    assert [m.role for m in msgs] == ["user", "assistant", "tool", "assistant"]
+    # assistant 回合携带工具调用
+    assert msgs[1].content == "我来读取。"
+    assert [c.id for c in msgs[1].tool_calls] == ["call_1"]
+    assert msgs[1].tool_calls[0].name == "read_file"
+    assert msgs[1].tool_calls[0].input == '{"path": "pyproject.toml"}'
+    # tool 回合携带执行结果
+    assert msgs[2].tool_results[0].tool_call_id == "call_1"
+    assert msgs[2].tool_results[0].content == "已读取，内容如下"
+    assert msgs[2].tool_results[0].is_error is False
 
 
 def test_messages_returns_copy():
