@@ -20,6 +20,9 @@ class GlobTool:
             "结果最多 100 条并排序，便于定位项目结构。"
         )
 
+    def read_only(self) -> bool:
+        return True
+
     def parameters(self) -> dict:
         return {
             "type": "object",

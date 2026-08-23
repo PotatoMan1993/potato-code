@@ -16,6 +16,9 @@ class ReadFileTool:
     def description(self) -> str:
         return "读取指定文件并返回其内容（带行号）。文件不存在或不可读时返回错误。"
 
+    def read_only(self) -> bool:
+        return True
+
     def parameters(self) -> dict:
         return {
             "type": "object",

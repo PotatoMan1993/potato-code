@@ -48,6 +48,32 @@ async def test_registry_execute_unknown_tool():
     assert "未知工具" in r.content
 
 
+def test_read_only_classification():
+    """只读分类：read_file/glob/grep 只读；write_file/edit_file/bash 有副作用（F5）。"""
+    assert ReadFileTool().read_only() is True
+    assert GlobTool().read_only() is True
+    assert GrepTool().read_only() is True
+    assert WriteFileTool().read_only() is False
+    assert EditFileTool().read_only() is False
+    assert BashTool().read_only() is False
+
+
+def test_read_only_definitions():
+    """Plan Mode 只导出只读工具定义，保留注册顺序（F10）。"""
+    reg = new_default_registry()
+    defs = reg.read_only_definitions()
+    assert [d.name for d in defs] == ["read_file", "glob", "grep"]
+
+
+def test_is_read_only():
+    """分批判定：已注册只读工具为 True；有副作用与未知工具为 False（F5）。"""
+    reg = new_default_registry()
+    assert reg.is_read_only("read_file") is True
+    assert reg.is_read_only("grep") is True
+    assert reg.is_read_only("bash") is False
+    assert reg.is_read_only("no_such_tool") is False
+
+
 # ────────── read_file ──────────
 
 

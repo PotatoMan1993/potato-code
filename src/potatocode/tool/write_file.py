@@ -16,6 +16,9 @@ class WriteFileTool:
     def description(self) -> str:
         return "将内容写入指定文件（覆盖已有内容）；父目录不存在时自动创建。"
 
+    def read_only(self) -> bool:
+        return False
+
     def parameters(self) -> dict:
         return {
             "type": "object",

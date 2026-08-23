@@ -23,6 +23,10 @@ class BashTool:
             "可用于查看文件、运行脚本、执行构建等。"
         )
 
+    def read_only(self) -> bool:
+        # 可执行任意副作用命令，保守归为有副作用、串行执行
+        return False
+
     def parameters(self) -> dict:
         return {
             "type": "object",

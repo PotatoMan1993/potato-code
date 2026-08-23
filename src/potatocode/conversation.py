@@ -40,3 +40,7 @@ class Conversation:
     def messages(self) -> list[Message]:
         """返回完整历史的副本（防止外部修改内部状态）。"""
         return list(self._messages)
+
+    def last_role(self) -> str:
+        """返回最后一条消息的 role；空历史返回 ""（终止收尾判断角色尾巴用，F6）。"""
+        return self._messages[-1].role if self._messages else ""

@@ -1,9 +1,10 @@
 """anthropic 适配器：封装 AsyncAnthropic，统一吐出文本增量与工具调用。
 
-- 注入内置 system prompt；
+- 注入内置 system prompt；system_suffix 非空时拼接到其后（Plan Mode，F10）；
 - tools 非空时随请求注入工具定义（F3）；
 - 按配置开启扩展思考（thinking）；含工具交互历史的请求关闭 thinking（避免 400）；
 - 思考增量接收即丢弃；模型发起工具调用时以 StreamEvent(tool_calls=...) 一次性上抛；
+- 流正常结束后上抛本轮 token 用量 StreamEvent(usage=...)（F8）；
 - 正常结束 yield done 事件，异常 yield err 事件（不抛出给上层）。
 """
 
@@ -17,10 +18,15 @@ from typing import TYPE_CHECKING, Any
 import anthropic
 
 from ..prompt import SYSTEM_PROMPT
-from . import Message, StreamEvent, ToolCall, ToolDefinition
+from . import Message, StreamEvent, ToolCall, ToolDefinition, Usage
 
 if TYPE_CHECKING:
     from ..config import ProviderConfig
+
+
+def _effective_system(suffix: str) -> str:
+    """系统提示：suffix 为空取单段 SYSTEM_PROMPT；非空时拼接为单段字符串。"""
+    return SYSTEM_PROMPT if not suffix else SYSTEM_PROMPT + "\n\n" + suffix
 
 
 def _to_anthropic_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
@@ -106,12 +112,13 @@ class AnthropicProvider:
         self,
         msgs: list[Message],
         tools: list[ToolDefinition],
+        system_suffix: str = "",
     ) -> AsyncIterator[StreamEvent]:
         """发起一轮流式对话，以 async generator 吐出 StreamEvent。"""
         params: dict[str, Any] = {
             "model": self._model,
             "max_tokens": 4096,
-            "system": SYSTEM_PROMPT,
+            "system": _effective_system(system_suffix),
             "messages": _to_anthropic_messages(msgs),
         }
         if tools:
@@ -127,6 +134,13 @@ class AnthropicProvider:
                     if event.type == "content_block_delta" and event.delta.type == "text_delta":
                         yield StreamEvent(text=event.delta.text)
             final_message = await stream.get_final_message()
+            # 流正常结束后一次性上抛本轮 token 用量（F8），先于 done 事件
+            yield StreamEvent(
+                usage=Usage(
+                    input_tokens=final_message.usage.input_tokens,
+                    output_tokens=final_message.usage.output_tokens,
+                )
+            )
             if final_message.stop_reason == "tool_use":
                 # 用 SDK 汇总的完整消息收集 tool_use 块（SDK 已累加 input JSON）
                 calls = [

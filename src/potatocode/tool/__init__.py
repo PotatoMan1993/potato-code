@@ -51,6 +51,8 @@ class Tool(Protocol):
 
     def parameters(self) -> dict[str, Any]: ...  # 手写 JSON Schema（type/properties/required）
 
+    def read_only(self) -> bool: ...  # True=只读：可并发执行 & Plan Mode 放行（F5/F10）
+
     async def execute(self, args: str) -> Result: ...
 
 
@@ -99,6 +101,23 @@ class Registry:
             )
             for name in self._order
         ]
+
+    def read_only_definitions(self) -> list[ToolDefinition]:
+        """Plan Mode：只导出 read_only 工具的定义，保留注册顺序（F10）。"""
+        return [
+            ToolDefinition(
+                name=name,
+                description=self._tools[name].description(),
+                input_schema=self._tools[name].parameters(),
+            )
+            for name in self._order
+            if self._tools[name].read_only()
+        ]
+
+    def is_read_only(self, name: str) -> bool:
+        """分批判定：工具是否只读（可并发）；未知工具返回 False（按串行处理）（F5）。"""
+        t = self._tools.get(name)
+        return t is not None and t.read_only()
 
     async def execute(self, name: str, args: str, timeout: float = DEFAULT_TIMEOUT) -> Result:
         """按名执行工具；未命中 / 超时 / 任何异常都包成结构化 Result（F5/F9/N4）。"""

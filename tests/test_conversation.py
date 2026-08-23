@@ -62,3 +62,24 @@ def test_messages_returns_copy():
     snapshot.clear()  # 清空副本
 
     assert len(conv.messages()) == 1  # 内部历史不受影响
+
+
+def test_last_role():
+    """last_role：空历史返回 ""，否则返回末尾消息的 role（F6 终止收尾）。"""
+    conv = Conversation()
+    assert conv.last_role() == ""
+
+    conv.add_user("读一下配置文件")
+    assert conv.last_role() == "user"
+
+    conv.add_assistant_with_tool_calls(
+        "我来读取。",
+        [ToolCall(id="call_1", name="read_file", input='{"path": "pyproject.toml"}')],
+    )
+    assert conv.last_role() == "assistant"
+
+    conv.add_tool_results([ToolResult(tool_call_id="call_1", content="已读取")])
+    assert conv.last_role() == "tool"
+
+    conv.add_assistant("配置已就绪。")
+    assert conv.last_role() == "assistant"

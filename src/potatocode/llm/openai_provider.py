@@ -1,9 +1,11 @@
 """openai 适配器：封装 AsyncOpenAI chat.completions，统一吐出文本增量与工具调用。
 
-- 内置 system prompt 作为首条 system 消息注入；
+- 内置 system prompt 作为首条 system 消息注入；system_suffix 非空时拼接到其后
+  （Plan Mode，F10）；
 - tools 非空时随请求注入工具定义（F3）；
 - thinking 配置在 openai 协议下忽略；
 - 流式按 index 累加 tool_calls 分片，组装完整工具调用（F4）；
+- 打开 stream_options include_usage，流末尾 chunk 上抛本轮 token 用量（F8）；
 - 正常结束 yield done 事件，异常 yield err 事件（不抛出给上层）。
 """
 
@@ -17,10 +19,15 @@ import openai
 from openai.types.chat import ChatCompletion, ChatCompletionMessageParam
 
 from ..prompt import SYSTEM_PROMPT
-from . import Message, StreamEvent, ToolCall, ToolDefinition
+from . import Message, StreamEvent, ToolCall, ToolDefinition, Usage
 
 if TYPE_CHECKING:
     from ..config import ProviderConfig
+
+
+def _effective_system(suffix: str) -> str:
+    """系统提示：suffix 为空取单段 SYSTEM_PROMPT；非空时拼接为单段字符串。"""
+    return SYSTEM_PROMPT if not suffix else SYSTEM_PROMPT + "\n\n" + suffix
 
 
 def _to_openai_tools(tools: list[ToolDefinition]) -> list[dict[str, object]]:
@@ -94,10 +101,13 @@ class OpenAIProvider:
         self,
         msgs: list[Message],
         tools: list[ToolDefinition],
+        system_suffix: str = "",
     ) -> AsyncIterator[StreamEvent]:
         """发起一轮流式对话，以 async generator 吐出 StreamEvent。"""
-        # 首条注入内置 system prompt，其后是完整多轮历史
-        messages: list[ChatCompletionMessageParam] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        # 首条注入内置 system prompt（可带计划态后缀），其后是完整多轮历史
+        messages: list[ChatCompletionMessageParam] = [
+            {"role": "system", "content": _effective_system(system_suffix)}
+        ]
         for m in msgs:
             messages.extend(_to_params(m))
 
@@ -105,6 +115,8 @@ class OpenAIProvider:
             "model": self._model,
             "messages": messages,
             "stream": True,
+            # 开启后流末尾会出现带 usage 的 chunk，供本轮用量上抛（F8）
+            "stream_options": {"include_usage": True},
         }
         if tools:
             kwargs["tools"] = _to_openai_tools(tools)
@@ -119,6 +131,14 @@ class OpenAIProvider:
             async for chunk in stream:
                 # 个别 chunk（如仅含 usage）可能没有 choices
                 if not chunk.choices:
+                    if chunk.usage:
+                        # 流末尾的用量 chunk：一次性上抛本轮 token 用量（F8）
+                        yield StreamEvent(
+                            usage=Usage(
+                                input_tokens=chunk.usage.prompt_tokens or 0,
+                                output_tokens=chunk.usage.completion_tokens or 0,
+                            )
+                        )
                     continue
                 choice = chunk.choices[0]
                 delta = choice.delta

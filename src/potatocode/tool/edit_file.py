@@ -22,6 +22,9 @@ class EditFileTool:
             "否则返回错误，请提供足够长的上下文使其唯一。"
         )
 
+    def read_only(self) -> bool:
+        return False
+
     def parameters(self) -> dict:
         return {
             "type": "object",

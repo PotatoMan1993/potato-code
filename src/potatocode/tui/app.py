@@ -15,14 +15,15 @@ from textual.message import Message
 from textual.timer import Timer
 from textual.widgets import RichLog, Static, TextArea
 
+from ..agent import Mode
 from ..config import ProviderConfig
 from ..conversation import Conversation
 from ..llm import Provider, new_provider
-from ..prompt import render_banner
+from ..prompt import EXECUTE_DIRECTIVE, render_banner
 from ..tool import Registry
 from .select import ProviderSelect
 from .stream import StreamMixin
-from .view import SessionState, ToolDisplay, statusbar_content, user_block
+from .view import SessionState, ToolDisplay, notice_block, statusbar_content, user_block
 
 
 class ChatSubmitted(Message):
@@ -34,15 +35,15 @@ class ChatSubmitted(Message):
 
 
 class ChatTextArea(TextArea):
-    """聊天输入框：Enter 提交，Alt+Enter 换行，Ctrl+C 退出。
+    """聊天输入框：Enter 提交，Alt+Enter 换行，Ctrl+C 取消本轮/退出。
 
     TextArea 默认在 `_on_key` 中直接把 enter 作为换行插入并 stop 事件，
     binding 无法覆盖，因此在 `_on_key` 里拦截（官方文档推荐的扩展方式）。
     """
 
     BINDINGS = [
-        # 覆盖 TextArea 自带的 ctrl+c→复制，保证全局 Ctrl+C 退出
-        Binding("ctrl+c", "quit", "Quit", show=False),
+        # 覆盖 TextArea 自带的 ctrl+c→复制；流式态取消本轮、空闲态退出（F7）
+        Binding("ctrl+c", "cancel_or_quit", "Quit", show=False),
     ]
 
     async def _on_key(self, event: events.Key) -> None:
@@ -60,9 +61,11 @@ class ChatTextArea(TextArea):
             return
         await super()._on_key(event)
 
-    async def action_quit(self) -> None:
-        """Ctrl+C：委托给 App 的安全退出（取消进行中的流）。"""
-        await self.app.action_quit()
+    def action_cancel_or_quit(self) -> None:
+        """Ctrl+C：委托给 App——流式态取消本轮，空闲态退出程序（F7/AC10）。"""
+        app = self.app
+        assert isinstance(app, PotatoCodeApp)
+        app.action_cancel_or_quit()
 
 
 class PotatoCodeApp(StreamMixin, App):
@@ -137,7 +140,10 @@ class PotatoCodeApp(StreamMixin, App):
     """
 
     BINDINGS = [
-        Binding("ctrl+c", "quit", "Quit"),
+        # 流式态取消本轮（不退出）；空闲态退出程序（F7/AC10）
+        Binding("ctrl+c", "cancel_or_quit", "Quit"),
+        # Esc：仅流式态有意义——取消本轮
+        Binding("escape", "cancel_turn", "Cancel turn", show=False),
     ]
 
     def __init__(self, providers: list[ProviderConfig], version: str, registry: Registry) -> None:
@@ -151,7 +157,12 @@ class PotatoCodeApp(StreamMixin, App):
         self.state = SessionState.IDLE
         self.cur_reply = ""
         self.turn_start = 0.0
-        self._cur_tool: ToolDisplay | None = None  # 执行中工具指示（F8/N2）
+        self.mode: Mode = Mode.NORMAL  # 当前模式，/plan /do 切换，跨轮保持（F10）
+        self.iter = 0  # 当前迭代轮次（进度显示，F9）
+        self.usage_in = 0  # 会话累计输入 token（F8）
+        self.usage_out = 0  # 会话累计输出 token（F8）
+        self.cur_tools: list[ToolDisplay] = []  # 执行中工具指示（并发批可多个，F5/N2）
+        self.turn_cancel: asyncio.Event | None = None  # 本轮取消事件（F7）
         self._stream_task: asyncio.Task | None = None
         self._timer: Timer | None = None
 
@@ -203,12 +214,20 @@ class PotatoCodeApp(StreamMixin, App):
         self.query_one(ChatTextArea).focus()
 
     def _update_statusbar(self) -> None:
-        """刷新底部状态栏：左侧 provider 名、右侧模型名。"""
+        """刷新底部状态栏：左侧 provider 名 + 模式徽标、右侧累计用量 + 模型名。"""
         bar = self.query_one("#statusbar", Static)
         if self.provider is None:
             bar.update(statusbar_content(None, None))
         else:
-            bar.update(statusbar_content(self.provider.name, self.provider.model))
+            bar.update(
+                statusbar_content(
+                    self.provider.name,
+                    self.provider.model,
+                    plan_mode=self.mode is Mode.PLAN,
+                    usage_in=self.usage_in,
+                    usage_out=self.usage_out,
+                )
+            )
 
     # ────────────────────── 事件处理 ──────────────────────
 
@@ -221,7 +240,7 @@ class PotatoCodeApp(StreamMixin, App):
         self._activate_provider(cfg)
 
     async def on_chat_submitted(self, event: ChatSubmitted) -> None:
-        """处理输入框提交：/exit 退出；IDLE 时发起一轮流式对话。"""
+        """处理输入框提交：/exit /plan /do 命令；IDLE 时发起一轮流式对话。"""
         text = event.text.strip()
         input_box = self.query_one(ChatTextArea)
 
@@ -235,17 +254,55 @@ class PotatoCodeApp(StreamMixin, App):
             # 流式期间 / 未选定 provider：不接受新提交（保留已输入内容）
             return
 
+        if text == "/plan":
+            # 进入计划模式：仅只读工具 + 计划态系统后缀（F10）
+            input_box.clear()
+            self.mode = Mode.PLAN
+            self.query_one("#log", RichLog).write(
+                notice_block("已进入计划模式（仅只读工具；输入 /do 按计划执行）")
+            )
+            self._update_statusbar()
+            return
+        if text == "/do":
+            # 切回全工具模式，注入执行指令立即按上文计划开跑（/do 本身不入历史）
+            input_box.clear()
+            self.mode = Mode.NORMAL
+            self._update_statusbar()
+            self.conv.add_user(EXECUTE_DIRECTIVE)
+            self.query_one("#log", RichLog).write(user_block(EXECUTE_DIRECTIVE))
+            self._start_turn()
+            return
+
         input_box.clear()
         self.conv.add_user(text)
         self.query_one("#log", RichLog).write(user_block(text))
+        self._start_turn()
+
+    def _start_turn(self) -> None:
+        """启动一轮 Agent Loop：建取消事件、起消费 task、进 STREAMING 态。"""
         self.cur_reply = ""
+        self.cur_tools = []
+        self.iter = 0
         self.turn_start = time.monotonic()
+        self.turn_cancel = asyncio.Event()
         self.state = SessionState.STREAMING
         self._refresh_streaming_view()
         self._stream_task = asyncio.create_task(self._consume_agent_events())
         self._timer = self.set_interval(0.1, self._tick)
 
-    # ────────────────────── 退出 ──────────────────────
+    # ────────────────────── 取消与退出 ──────────────────────
+
+    def action_cancel_or_quit(self) -> None:
+        """Ctrl+C：流式态取消本轮（不退出程序）；空闲态退出程序（F7/AC10）。"""
+        if self.state is SessionState.STREAMING and self.turn_cancel is not None:
+            self.turn_cancel.set()
+        else:
+            self.exit()
+
+    def action_cancel_turn(self) -> None:
+        """Esc：流式态取消本轮；其余状态忽略（F7/AC10）。"""
+        if self.state is SessionState.STREAMING and self.turn_cancel is not None:
+            self.turn_cancel.set()
 
     async def action_quit(self) -> None:
         """安全退出：先取消进行中的流式 task，再退出应用（还原终端）。"""

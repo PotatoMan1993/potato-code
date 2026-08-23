@@ -52,6 +52,9 @@ class GrepTool:
             "可用 glob 参数限定只搜某些文件（如 *.py）。结果最多 100 条。"
         )
 
+    def read_only(self) -> bool:
+        return True
+
     def parameters(self) -> dict:
         return {
             "type": "object",

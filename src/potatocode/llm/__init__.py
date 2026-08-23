@@ -60,15 +60,25 @@ class Message:
 
 
 @dataclass
-class StreamEvent:
-    """流式事件：文本增量 / 工具调用 / 正常结束 / 出错。
+class Usage:
+    """协议无关地承载一轮请求的 token 用量。"""
 
-    四态：text 非空表示正文增量；tool_calls 非空表示本轮模型请求执行这些工具
-    （在 done 之前一次性上抛）；done 与 err 互斥，标识本轮结束。
+    input_tokens: int = 0  # 本轮请求输入（含完整历史）token 数
+    output_tokens: int = 0  # 本轮响应输出 token 数
+
+
+@dataclass
+class StreamEvent:
+    """流式事件：文本增量 / 工具调用 / 用量 / 正常结束 / 出错。
+
+    五态：text 非空表示正文增量；tool_calls 非空表示本轮模型请求执行这些工具
+    （在 done 之前一次性上抛）；usage 非空表示本轮 token 用量（done 之前一次性发出）；
+    done 与 err 互斥，标识本轮结束。
     """
 
     text: str = ""  # 文本增量
     tool_calls: list[ToolCall] = field(default_factory=list)  # 非空：本轮模型请求执行的工具
+    usage: Usage | None = None  # 非空：本轮 token 用量，done 之前一次性发出
     done: bool = False  # 本轮正常结束
     err: Exception | None = None  # 出错时携带异常
 
@@ -77,10 +87,12 @@ class StreamEvent:
 class Provider(Protocol):
     """协议无关的对话 provider 接口。
 
-    `stream(msgs, tools)` 发起一轮流式对话：内部注入内置 system prompt 与 thinking
-    配置；tools 非空时随请求注入工具定义（F3）；思考增量内部丢弃；流中模型发起
-    工具调用时以 StreamEvent(tool_calls=...) 上抛；以 async generator 吐出 StreamEvent；
-    调用方 cancel 对应 task 即终止本轮。
+    `stream(msgs, tools, system_suffix)` 发起一轮流式对话：内部注入内置 system prompt
+    与 thinking 配置；`system_suffix` 非空时拼接到内置 SYSTEM_PROMPT 之后（Plan Mode
+    计划态约束，F10）；tools 非空时随请求注入工具定义（F3）；思考增量内部丢弃；
+    流中模型发起工具调用时以 StreamEvent(tool_calls=...) 上抛；流结束后以
+    StreamEvent(usage=...) 上抛本轮 token 用量（F8）；以 async generator 吐出
+    StreamEvent；调用方 cancel 对应 task 即终止本轮。
     """
 
     @property
@@ -93,6 +105,7 @@ class Provider(Protocol):
         self,
         msgs: list[Message],
         tools: list[ToolDefinition],
+        system_suffix: str = "",
     ) -> AsyncIterator[StreamEvent]: ...
 
 
@@ -116,6 +129,7 @@ __all__ = [
     "ToolCall",
     "ToolDefinition",
     "ToolResult",
+    "Usage",
     "ROLE_ASSISTANT",
     "ROLE_TOOL",
     "ROLE_USER",

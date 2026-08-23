@@ -30,15 +30,40 @@ class ToolDisplay:
     args: str
 
 
-def statusbar_content(name: str | None, model: str | None) -> RenderableType:
-    """底部状态栏：左侧 provider 名称、右侧模型名，两端对齐。"""
+def _fmt_tokens(n: int) -> str:
+    """紧凑数字：1234 → 1.2k（状态栏用量展示，AC11）。"""
+    if n >= 1000:
+        return f"{n / 1000:.1f}k"
+    return str(n)
+
+
+def statusbar_content(
+    name: str | None,
+    model: str | None,
+    plan_mode: bool = False,
+    usage_in: int = 0,
+    usage_out: int = 0,
+) -> RenderableType:
+    """底部状态栏：左侧 provider 名（计划模式附 PLAN 徽标）、右侧累计用量 + 模型名。"""
+    left = Text()
+    if plan_mode:
+        left.append("⏵⏵ plan mode on", style="bold green")
+    else:
+        left.append("⏵⏵ accept edits on", style="bold green")
+    if model:
+        left.append(f" ● {model}", style="cyan")
+    else:
+        left.append(" ● 请选择 provider", style="red")
+    left.append(f" ● {name or 'PotatoCode'}", style="dim")
+
+    right = Text()
+    if model:
+        # 会话累计计费 token（每轮输入/输出分别累加，F8）
+        right.append(f"↑{_fmt_tokens(usage_in)} ↓{_fmt_tokens(usage_out)} tokens", style="dim")
     grid = Table.grid(expand=True)
     grid.add_column(justify="left", ratio=1)
     grid.add_column(justify="right", ratio=1)
-    grid.add_row(
-        Text(name or "PotatoCode", style="bold cyan"),
-        Text(model or "请选择 provider", style="dim"),
-    )
+    grid.add_row(left, right)
     return grid
 
 
@@ -92,4 +117,12 @@ def error_block(err: Exception) -> RenderableType:
     return Group(
         Text(""),
         Text(f"✗ {type(err).__name__}: {err}", style="bold red"),
+    )
+
+
+def notice_block(text: str) -> RenderableType:
+    """系统提示块（灰色）：模式切换 / 停止原因 / 取消等，仅展示不入历史。"""
+    return Group(
+        Text(""),
+        Text(text, style="dim italic"),
     )
