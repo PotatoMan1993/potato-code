@@ -1,11 +1,11 @@
 """openai 适配器：封装 AsyncOpenAI chat.completions，统一吐出文本增量与工具调用。
 
-- 内置 system prompt 作为首条 system 消息注入；system_suffix 非空时拼接到其后
-  （Plan Mode，F10）；
+- 系统消息单条：stable 在前、environment 拼其后（F3）；stable 居前缀以便端点前缀缓存命中；
 - tools 非空时随请求注入工具定义（F3）；
+- reminder 非空时追加一条尾部 user 消息（OpenAI 容忍连续 user，N3）；
 - thinking 配置在 openai 协议下忽略；
 - 流式按 index 累加 tool_calls 分片，组装完整工具调用（F4）；
-- 打开 stream_options include_usage，流末尾 chunk 上抛本轮 token 用量（F8）；
+- 打开 stream_options include_usage，流末尾 chunk 上抛本轮 token 用量（含 cached_tokens，F4/F8）；
 - 正常结束 yield done 事件，异常 yield err 事件（不抛出给上层）。
 """
 
@@ -18,16 +18,10 @@ from typing import TYPE_CHECKING, Any
 import openai
 from openai.types.chat import ChatCompletion, ChatCompletionMessageParam
 
-from ..prompt import SYSTEM_PROMPT
-from . import Message, StreamEvent, ToolCall, ToolDefinition, Usage
+from . import Message, Request, StreamEvent, ToolCall, ToolDefinition, Usage
 
 if TYPE_CHECKING:
     from ..config import ProviderConfig
-
-
-def _effective_system(suffix: str) -> str:
-    """系统提示：suffix 为空取单段 SYSTEM_PROMPT；非空时拼接为单段字符串。"""
-    return SYSTEM_PROMPT if not suffix else SYSTEM_PROMPT + "\n\n" + suffix
 
 
 def _to_openai_tools(tools: list[ToolDefinition]) -> list[dict[str, object]]:
@@ -77,6 +71,20 @@ def _to_params(m: Message) -> list[ChatCompletionMessageParam]:
     ]
 
 
+def _to_openai_messages(req: Request) -> list[ChatCompletionMessageParam]:
+    """组装 openai 消息序列：单条 system（stable+env）+ 历史 + 可选尾部 reminder。"""
+    sys_content = req.system.stable
+    if req.system.environment:
+        sys_content = f"{req.system.stable}\n\n{req.system.environment}"
+    messages: list[ChatCompletionMessageParam] = [{"role": "system", "content": sys_content}]
+    for m in req.messages:
+        messages.extend(_to_params(m))
+    if req.reminder:
+        # 追加尾部 user 消息承载补充指令（OpenAI 容忍连续 user / tool 后接 user，N3）
+        messages.append({"role": "user", "content": req.reminder})
+    return messages
+
+
 class OpenAIProvider:
     """openai 协议适配器（兼容各类 OpenAI 协议端点）。"""
 
@@ -97,29 +105,17 @@ class OpenAIProvider:
     def model(self) -> str:
         return self._model
 
-    async def stream(
-        self,
-        msgs: list[Message],
-        tools: list[ToolDefinition],
-        system_suffix: str = "",
-    ) -> AsyncIterator[StreamEvent]:
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
         """发起一轮流式对话，以 async generator 吐出 StreamEvent。"""
-        # 首条注入内置 system prompt（可带计划态后缀），其后是完整多轮历史
-        messages: list[ChatCompletionMessageParam] = [
-            {"role": "system", "content": _effective_system(system_suffix)}
-        ]
-        for m in msgs:
-            messages.extend(_to_params(m))
-
         kwargs: dict[str, Any] = {
             "model": self._model,
-            "messages": messages,
+            "messages": _to_openai_messages(req),
             "stream": True,
             # 开启后流末尾会出现带 usage 的 chunk，供本轮用量上抛（F8）
             "stream_options": {"include_usage": True},
         }
-        if tools:
-            kwargs["tools"] = _to_openai_tools(tools)
+        if req.tools:
+            kwargs["tools"] = _to_openai_tools(req.tools)
 
         try:
             stream = await self._client.chat.completions.create(**kwargs)
@@ -133,10 +129,21 @@ class OpenAIProvider:
                 if not chunk.choices:
                     if chunk.usage:
                         # 流末尾的用量 chunk：一次性上抛本轮 token 用量（F8）
+                        # cached_tokens 缺失即零值（N6）；OpenAI 前缀缓存无写计数，cache_write 恒 0
+                        cache_read = (
+                            getattr(
+                                getattr(chunk.usage, "prompt_tokens_details", None),
+                                "cached_tokens",
+                                0,
+                            )
+                            or 0
+                        )
                         yield StreamEvent(
                             usage=Usage(
                                 input_tokens=chunk.usage.prompt_tokens or 0,
                                 output_tokens=chunk.usage.completion_tokens or 0,
+                                cache_read=cache_read,
+                                cache_write=0,
                             )
                         )
                     continue

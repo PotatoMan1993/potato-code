@@ -52,6 +52,7 @@ class StreamMixin:
     cur_tools: list[ToolDisplay]
     turn_cancel: asyncio.Event | None
     _tool_registry: Registry
+    _version: str
     _timer: Timer | None
     _stream_task: asyncio.Task | None
 
@@ -66,7 +67,7 @@ class StreamMixin:
         """
         assert self.provider is not None
         assert self.turn_cancel is not None
-        agent = Agent(self.provider, self._tool_registry)
+        agent = Agent(self.provider, self._tool_registry, self._version)
         try:
             async for ev in agent.run(self.conv, self.mode, self.turn_cancel):
                 if ev.err is not None:
@@ -114,7 +115,9 @@ class StreamMixin:
                 self.cur_reply = ""
             self.cur_tools.append(ToolDisplay(te.name, te.args))
         else:
-            td = self.cur_tools.pop(0) if self.cur_tools else ToolDisplay(te.name, te.args) # agent层会按照模型输出的工具调用的顺序来上报各个工具的执行预览和执行结果
+            td = (
+                self.cur_tools.pop(0) if self.cur_tools else ToolDisplay(te.name, te.args)
+            )  # agent 按模型调用序上报执行预览与结果
             log.write(tool_line(td.name, td.args))
             log.write(tool_result_summary(te.result, te.is_error))
         self._refresh_streaming_view()

@@ -20,6 +20,8 @@ from ..conversation import Conversation
 from ..llm import (
     ROLE_ASSISTANT,
     Provider,
+    Request,
+    System,
     ToolCall,
     ToolDefinition,
     ToolResult,
@@ -34,6 +36,8 @@ _ARGS_PREVIEW_LIMIT = 80
 MAX_ITERATIONS: int = 25
 # 连续「整轮只产生未知工具调用」的迭代数上限（F2-4：避免对幻觉工具空转）
 MAX_UNKNOWN_RUN: int = 3
+# 规划模式提醒的完整版注入间隔轮数（F7：首轮完整、每 N 轮重复完整、其余精简）
+PLAN_REMINDER_INTERVAL: int = 4
 
 # 停止/收尾提示文案——既作为 Event(notice=...) 推给 UI，也作为历史兜底文本（F6）
 NOTICE_MAX_ITER = "（已达最大迭代轮数 25，自动停止；可继续发消息推进。）"
@@ -53,7 +57,7 @@ class Phase(Enum):
 
 
 class Mode(IntEnum):
-    """运行模式：NORMAL 全工具；PLAN 仅只读工具 + 计划态系统后缀（F10）。"""
+    """运行模式：NORMAL 全工具；PLAN 仅只读工具 + 按轮次注入计划态提醒（F7/F10）。"""
 
     NORMAL = 0
     PLAN = 1
@@ -72,10 +76,12 @@ class ToolEvent:
 
 @dataclass
 class Usage:
-    """一轮请求的 token 用量（透传 llm.Usage 的语义）。"""
+    """一轮请求的 token 用量（透传 llm.Usage 的语义，含缓存命中，F4）。"""
 
     input: int = 0
     output: int = 0
+    cache_write: int = 0
+    cache_read: int = 0
 
 
 @dataclass
@@ -141,9 +147,10 @@ class Agent:
     `cancel` 由调用方持有，触发 `cancel.set()` 即中断本轮。
     """
 
-    def __init__(self, provider: Provider, registry: Registry) -> None:
+    def __init__(self, provider: Provider, registry: Registry, version: str = "") -> None:
         self._provider = provider
         self._registry = registry
+        self._version = version
 
     async def run(
         self,
@@ -152,12 +159,13 @@ class Agent:
         cancel: asyncio.Event,
     ) -> AsyncIterator[Event]:
         """执行 Agent Loop，以 async generator 吐出事件流。"""
+        # 每次 run 起始采集环境、装配稳定系统提示（普通/规划一致；规划提醒已移出系统通道）
+        env_text = prompt.gather_environment(self._version, self._provider.model).render()
+        sys = prompt.build_system_prompt()
         if mode is Mode.PLAN:
             defs = self._registry.read_only_definitions()
-            suffix = prompt.PLAN_MODE_REMINDER
         else:
             defs = self._registry.definitions()
-            suffix = ""
 
         unknown_run = 0
         for it in range(1, MAX_ITERATIONS + 1):
@@ -166,9 +174,15 @@ class Agent:
                 self._finish_cancelled(conv)
                 return
 
+            # 规划模式按轮次注入 reminder：首轮完整、间隔轮完整、其余精简（F7）
+            reminder = ""
+            if mode is Mode.PLAN:
+                full = it == 1 or (it - 1) % PLAN_REMINDER_INTERVAL == 0
+                reminder = prompt.plan_reminder(full)
+
             # —— 请求本轮：转发文本增量，收集完整响应（含工具调用与用量）——
             outcome = _StreamOutcome()
-            async for item in self._stream_once(conv, defs, suffix, cancel):
+            async for item in self._stream_once(conv, defs, sys, env_text, reminder, cancel):
                 if isinstance(item, _StreamOutcome):
                     outcome = item
                 else:
@@ -190,6 +204,8 @@ class Agent:
                     usage=Usage(
                         input=outcome.usage.input_tokens,
                         output=outcome.usage.output_tokens,
+                        cache_write=outcome.usage.cache_write,
+                        cache_read=outcome.usage.cache_read,
                     )
                 )
 
@@ -210,10 +226,10 @@ class Agent:
             results: list[ToolResult] = []
             completed = True
             async for batch_item in self._execute_batched(outcome.calls, cancel):
-                if isinstance(batch_item, _BatchOutcome):   # 该批次所有工具的执行结果
+                if isinstance(batch_item, _BatchOutcome):  # 该批次所有工具的执行结果
                     results = batch_item.results
                     completed = batch_item.completed
-                else:   # 单个工具的执行结果Event
+                else:  # 单个工具的执行结果Event
                     yield batch_item
 
             conv.add_tool_results(results)  # 无条件回灌（含已取消占位，F6）
@@ -238,11 +254,14 @@ class Agent:
         self,
         conv: Conversation,
         defs: list[ToolDefinition],
-        suffix: str,
+        sys: str,
+        env_text: str,
+        reminder: str,
         cancel: asyncio.Event,
     ) -> AsyncIterator[Event | _StreamOutcome]:
         """发起一次请求：转发文本增量事件，累积完整文本与工具调用，记录本轮用量。
 
+        组装 `llm.Request`（稳定系统提示 + 环境段 + 本轮 reminder）发起请求；
         最后 yield `_StreamOutcome`；ok=False 表示流出错或已取消
         （出错时异常随 outcome.err 带回，由 run 收尾历史后再上抛）。
         双路收集：文本增量实时推给事件流，完整响应（含拼齐 JSON 参数的工具调用）
@@ -255,7 +274,13 @@ class Agent:
         text_parts: list[str] = []
         calls: list[ToolCall] = []
         usage: LlmUsage | None = None
-        async for ev in self._provider.stream(conv.messages(), defs, suffix):
+        req = Request(
+            messages=conv.messages(),
+            tools=defs,
+            system=System(stable=sys, environment=env_text),
+            reminder=reminder,
+        )
+        async for ev in self._provider.stream(req):
             if cancel.is_set():
                 yield _StreamOutcome(ok=False)
                 return
@@ -307,7 +332,7 @@ class Agent:
             else:
                 j = i + 1  # 有副作用：单独串行
 
-            for k in range(i, j):   # 按模型输出的工具顺序显示工具执行预览
+            for k in range(i, j):  # 按模型输出的工具顺序显示工具执行预览
                 yield Event(
                     tool=ToolEvent(
                         name=calls[k].name,
@@ -318,7 +343,7 @@ class Agent:
 
             completed = await self._run_batch(calls, i, j, results, cancel)
 
-            for k in range(i, j):   # 按照模型输出的工具顺序来显示工具执行结果
+            for k in range(i, j):  # 按照模型输出的工具顺序来显示工具执行结果
                 r = results[k]
                 assert r is not None  # _run_batch 保证区间内每个下标都已填充
                 yield Event(
@@ -372,7 +397,7 @@ class Agent:
                 for t in done:
                     if t is cancel_task:
                         continue
-                    tool_task = cast("asyncio.Task[ToolResult]", t) # 强行告诉类型检查器：对象t是asyncio.Task[ToolResult]类型
+                    tool_task = cast("asyncio.Task[ToolResult]", t)  # 类型检查收窄
                     results[tasks[tool_task]] = tool_task.result()
                     pending.discard(tool_task)
                 if cancel_task in done or cancel.is_set():
@@ -417,6 +442,7 @@ __all__ = [
     "NOTICE_MAX_ITER",
     "NOTICE_STREAM_ERR",
     "NOTICE_UNKNOWN_TOOLS",
+    "PLAN_REMINDER_INTERVAL",
     "Agent",
     "Event",
     "Mode",

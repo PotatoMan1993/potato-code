@@ -21,6 +21,7 @@ class BashTool:
         return (
             "在终端执行一条 shell 命令（支持管道/重定向），返回标准输出、标准错误与退出码。"
             "可用于查看文件、运行脚本、执行构建等。"
+            "读文件、找文件、搜内容请优先用 read_file/glob/grep，不要用 bash 拼凑。"
         )
 
     def read_only(self) -> bool:

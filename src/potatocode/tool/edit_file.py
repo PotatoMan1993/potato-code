@@ -20,6 +20,7 @@ class EditFileTool:
         return (
             "修改文件：把文件中的一段原文替换为新文本。old_string 必须唯一匹配，"
             "否则返回错误，请提供足够长的上下文使其唯一。"
+            "编辑前请先用 read_file 读取目标文件，确认 old_string 唯一。"
         )
 
     def read_only(self) -> bool:

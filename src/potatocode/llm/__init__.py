@@ -61,10 +61,30 @@ class Message:
 
 @dataclass
 class Usage:
-    """协议无关地承载一轮请求的 token 用量。"""
+    """协议无关地承载一轮请求的 token 用量（含缓存命中信息，F4）。"""
 
     input_tokens: int = 0  # 本轮请求输入（含完整历史）token 数
     output_tokens: int = 0  # 本轮响应输出 token 数
+    cache_write: int = 0  # Anthropic: cache_creation_input_tokens；OpenAI 恒 0
+    cache_read: int = 0  # Anthropic: cache_read_input_tokens；OpenAI: cached_tokens
+
+
+@dataclass
+class System:
+    """系统提示两段：稳定块（可缓存）与环境段（不缓存）（F3）。"""
+
+    stable: str = ""  # 可缓存：装配好的稳定系统提示（工具定义随 tools 一并进缓存前缀）
+    environment: str = ""  # 不缓存：环境信息段
+
+
+@dataclass
+class Request:
+    """一次流式请求的全部入参（替代 stream 的位置参数，N8）。"""
+
+    messages: list[Message] = field(default_factory=list)  # 持久对话历史（不含本轮 reminder）
+    tools: list[ToolDefinition] = field(default_factory=list)  # 本轮工具集（普通=全量/规划=只读）
+    system: System = field(default_factory=System)  # 稳定系统提示 + 环境段
+    reminder: str = ""  # 本轮 system-reminder 内容（已含标签；空=不注入）
 
 
 @dataclass
@@ -87,12 +107,12 @@ class StreamEvent:
 class Provider(Protocol):
     """协议无关的对话 provider 接口。
 
-    `stream(msgs, tools, system_suffix)` 发起一轮流式对话：内部注入内置 system prompt
-    与 thinking 配置；`system_suffix` 非空时拼接到内置 SYSTEM_PROMPT 之后（Plan Mode
-    计划态约束，F10）；tools 非空时随请求注入工具定义（F3）；思考增量内部丢弃；
-    流中模型发起工具调用时以 StreamEvent(tool_calls=...) 上抛；流结束后以
-    StreamEvent(usage=...) 上抛本轮 token 用量（F8）；以 async generator 吐出
-    StreamEvent；调用方 cancel 对应 task 即终止本轮。
+    `stream(req)` 发起一轮流式对话：`req.system.stable`（可缓存）与
+    `req.system.environment`（不缓存）分属不同内容块；`req.tools` 随请求注入工具定义；
+    `req.reminder` 非空时按各自协议安全织入消息通道（不污染缓存、不破坏角色交替）；
+    思考增量内部丢弃；流中模型发起工具调用时以 StreamEvent(tool_calls=...) 上抛；
+    流结束后以 StreamEvent(usage=...) 上抛本轮 token 用量（含缓存命中字段）；
+    以 async generator 吐出 StreamEvent；调用方 cancel 对应 task 即终止本轮。
     """
 
     @property
@@ -101,12 +121,7 @@ class Provider(Protocol):
     @property
     def model(self) -> str: ...  # -> 状态栏右
 
-    def stream(
-        self,
-        msgs: list[Message],
-        tools: list[ToolDefinition],
-        system_suffix: str = "",
-    ) -> AsyncIterator[StreamEvent]: ...
+    def stream(self, req: Request) -> AsyncIterator[StreamEvent]: ...
 
 
 def new_provider(cfg: ProviderConfig) -> Provider:
@@ -125,7 +140,9 @@ def new_provider(cfg: ProviderConfig) -> Provider:
 __all__ = [
     "Message",
     "Provider",
+    "Request",
     "StreamEvent",
+    "System",
     "ToolCall",
     "ToolDefinition",
     "ToolResult",

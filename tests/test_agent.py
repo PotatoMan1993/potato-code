@@ -10,7 +10,6 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 
-from potatocode import prompt
 from potatocode.agent import (
     MAX_ITERATIONS,
     MAX_UNKNOWN_RUN,
@@ -24,7 +23,7 @@ from potatocode.agent import (
     Phase,
 )
 from potatocode.conversation import Conversation
-from potatocode.llm import Message, StreamEvent, ToolCall, ToolDefinition
+from potatocode.llm import Request, StreamEvent, System, ToolCall, ToolDefinition
 from potatocode.llm import Usage as LlmUsage
 from potatocode.tool import Registry, Result, _parse_args, new_default_registry
 
@@ -34,6 +33,7 @@ class FakeProvider:
 
     `scripts` 每轮一个事件列表；`repeat` 在脚本耗尽后每轮恒返该脚本。
     工具调用 id 按轮重打，避免多轮历史中出现重复 id。
+    记录 `req.tools` / `req.system`（stable+environment）/ `req.reminder` 供断言。
     """
 
     def __init__(
@@ -45,7 +45,8 @@ class FakeProvider:
         self._repeat = repeat
         self.calls = 0
         self.tools_seen: list[list[ToolDefinition]] = []
-        self.suffix_seen: list[str] = []
+        self.systems_seen: list[System] = []
+        self.reminders_seen: list[str] = []
 
     @property
     def name(self) -> str:
@@ -55,15 +56,11 @@ class FakeProvider:
     def model(self) -> str:
         return "fake-model"
 
-    async def stream(
-        self,
-        msgs: list[Message],
-        tools: list[ToolDefinition],
-        system_suffix: str = "",
-    ) -> AsyncIterator[StreamEvent]:
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
         self.calls += 1
-        self.tools_seen.append(list(tools))
-        self.suffix_seen.append(system_suffix)
+        self.tools_seen.append(list(req.tools))
+        self.systems_seen.append(req.system)
+        self.reminders_seen.append(req.reminder)
         if self.calls <= len(self._scripts):
             script = self._scripts[self.calls - 1]
         else:
@@ -498,11 +495,11 @@ async def test_cancel_before_stream_starts():
     assert conv.messages()[-1].content == NOTICE_CANCELLED
 
 
-# ────────── 场景 F：Plan Mode 工具集（AC13/F10） ──────────
+# ────────── 场景 F：Plan Mode 工具集与 reminder（AC13/F7/F10） ──────────
 
 
-async def test_plan_mode_read_only_tools_and_suffix():
-    """AC13：PLAN 模式只注入只读工具定义 + 计划态系统后缀。"""
+async def test_plan_mode_read_only_tools_and_reminder():
+    """AC13/F7：PLAN 模式只注入只读工具定义 + 首轮注入完整 reminder。"""
     provider = FakeProvider(scripts=[[StreamEvent(text="计划：第一步…"), StreamEvent(done=True)]])
     agent = Agent(provider, new_default_registry())
     conv = Conversation()
@@ -512,12 +509,17 @@ async def test_plan_mode_read_only_tools_and_suffix():
 
     assert events[-1].done
     assert [d.name for d in provider.tools_seen[0]] == ["read_file", "glob", "grep"]
-    assert provider.suffix_seen[0] == prompt.PLAN_MODE_REMINDER
+    # 首轮 reminder 为完整版、带 system-reminder 标签（AC8/F6）
+    assert "<system-reminder>" in provider.reminders_seen[0]
+    assert "PLAN MODE" in provider.reminders_seen[0]
+    # 稳定系统提示与环境段均非空（F2/F3）
+    assert provider.systems_seen[0].stable
+    assert provider.systems_seen[0].environment
     assert conv.messages()[-1].content == "计划：第一步…"
 
 
-async def test_normal_mode_full_tools_and_no_suffix():
-    """对照：NORMAL 模式注入全部 6 个工具、无系统后缀。"""
+async def test_normal_mode_full_tools_and_no_reminder():
+    """对照：NORMAL 模式注入全部 6 个工具、不注入 reminder。"""
     provider = FakeProvider(scripts=[[StreamEvent(text="好"), StreamEvent(done=True)]])
     agent = Agent(provider, new_default_registry())
     conv = Conversation()
@@ -534,7 +536,7 @@ async def test_normal_mode_full_tools_and_no_suffix():
         "glob",
         "grep",
     ]
-    assert provider.suffix_seen[0] == ""
+    assert provider.reminders_seen[0] == ""
 
 
 # ────────── 场景 G：流出错恢复（AC5/F2） ──────────
@@ -574,3 +576,93 @@ async def test_stream_error_stops_turn_and_recovers():
         "user",
         "assistant",
     ]
+
+
+# ────────── 场景 H：规划模式按轮次注入 reminder（AC9/F6/F7） ──────────
+
+
+async def test_plan_mode_reminder_full_then_concise():
+    """AC9/F7：首轮完整提醒，间隔轮重复完整，其余轮精简。"""
+    provider = FakeProvider(
+        scripts=[
+            _turn_with_tools(ToolCall(id="x", name="read_file", input='{"path": "x"}')),
+            _turn_with_tools(ToolCall(id="x", name="glob", input='{"pattern": "*.py"}')),
+            [StreamEvent(text="计划完成。"), StreamEvent(done=True)],
+        ]
+    )
+    agent = Agent(provider, new_default_registry())
+    conv = Conversation()
+    conv.add_user("调研项目结构")
+
+    events = await _collect(agent, conv, mode=Mode.PLAN)
+
+    assert events[-1].done
+    # 三轮均注入 reminder，且带标签（AC8）
+    assert [r.count("<system-reminder>") for r in provider.reminders_seen] == [1, 1, 1]
+    # iter1 完整、iter2 精简（len 更小）；iter3 亦精简
+    assert len(provider.reminders_seen[1]) < len(provider.reminders_seen[0])
+    assert len(provider.reminders_seen[2]) < len(provider.reminders_seen[0])
+
+
+async def test_stable_system_same_across_modes():
+    """F7/N1：普通与规划模式 `req.system.stable` 相同（规划提醒已移出系统通道）。"""
+    p1 = FakeProvider(scripts=[[StreamEvent(text="x"), StreamEvent(done=True)]])
+    a1 = Agent(p1, new_default_registry())
+    c1 = Conversation()
+    c1.add_user("hi")
+    await _collect(a1, c1, mode=Mode.NORMAL)
+
+    p2 = FakeProvider(scripts=[[StreamEvent(text="x"), StreamEvent(done=True)]])
+    a2 = Agent(p2, new_default_registry())
+    c2 = Conversation()
+    c2.add_user("hi")
+    await _collect(a2, c2, mode=Mode.PLAN)
+
+    assert p1.systems_seen[0].stable == p2.systems_seen[0].stable
+    # 两模式环境段均非空（同一 cwd/平台，内容一致）
+    assert p1.systems_seen[0].environment == p2.systems_seen[0].environment
+
+
+async def test_reminder_not_in_conversation_history():
+    """AC8/N3：reminder 每轮动态构造、不写入持久对话历史。"""
+    provider = FakeProvider(scripts=[[StreamEvent(text="计划。"), StreamEvent(done=True)]])
+    agent = Agent(provider, new_default_registry())
+    conv = Conversation()
+    conv.add_user("做个计划")
+
+    await _collect(agent, conv, mode=Mode.PLAN)
+
+    assert [m.role for m in conv.messages()] == ["user", "assistant"]
+    for m in conv.messages():
+        assert "<system-reminder>" not in m.content
+
+
+async def test_cache_usage_passthrough():
+    """AC6/F4：fake 发缓存用量 → `Event.usage` 透传 cache_write/cache_read。"""
+    provider = FakeProvider(
+        scripts=[
+            [
+                StreamEvent(text="ok"),
+                StreamEvent(
+                    usage=LlmUsage(
+                        input_tokens=10,
+                        output_tokens=5,
+                        cache_write=30,
+                        cache_read=40,
+                    )
+                ),
+                StreamEvent(done=True),
+            ]
+        ]
+    )
+    agent = Agent(provider, new_default_registry())
+    conv = Conversation()
+    conv.add_user("hi")
+
+    events = await _collect(agent, conv)
+
+    usages = [e.usage for e in events if e.usage is not None]
+    assert len(usages) == 1
+    assert (usages[0].input, usages[0].output) == (10, 5)
+    assert usages[0].cache_write == 30
+    assert usages[0].cache_read == 40
