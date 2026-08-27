@@ -15,10 +15,13 @@ from rich.text import Text
 from textual.timer import Timer
 from textual.widgets import RichLog, Static
 
-from ..agent import NOTICE_CANCELLED, Agent, Mode, Phase, ToolEvent
+from ..agent import NOTICE_CANCELLED, Agent, ApprovalRequest, Mode, Phase, ToolEvent
+from ..permission import outcome_for_index
+from ..permission.engine import Engine
 from .view import (
     SessionState,
     ToolDisplay,
+    approval_block,
     assistant_block,
     error_block,
     notice_block,
@@ -51,6 +54,9 @@ class StreamMixin:
     usage_out: int
     cur_tools: list[ToolDisplay]
     turn_cancel: asyncio.Event | None
+    engine: Engine
+    pending: ApprovalRequest | None
+    approve_cursor: int
     _tool_registry: Registry
     _version: str
     _timer: Timer | None
@@ -63,13 +69,26 @@ class StreamMixin:
     async def _consume_agent_events(self) -> None:
         """消费 agent 事件流：文本进动态区，工具行/结果摘要/提示进 scrollback。
 
-        分派顺序：err → tool → usage → notice → iter → done → text（F3/F6）。
+        分派顺序：approval → err → tool → usage → notice → iter → done → text（F3/F6）。
         """
         assert self.provider is not None
         assert self.turn_cancel is not None
-        agent = Agent(self.provider, self._tool_registry, self._version)
+        agent = Agent(self.provider, self._tool_registry, self.engine, self._version)
         try:
             async for ev in agent.run(self.conv, self.mode, self.turn_cancel):
+                if ev.approval is not None:
+                    # 人在回路（F8）：切 APPROVING、暂停读事件，等用户决策
+                    self.pending = ev.approval
+                    self.approve_cursor = 0
+                    self.state = SessionState.APPROVING
+                    self._refresh_streaming_view()
+                    try:
+                        await ev.approval.respond
+                    except asyncio.CancelledError:
+                        raise  # App 退出时取消本轮
+                    self.pending = None
+                    self.state = SessionState.STREAMING
+                    continue
                 if ev.err is not None:
                     self._finish_with_error(ev.err)
                     return
@@ -130,6 +149,11 @@ class StreamMixin:
     def _refresh_streaming_view(self) -> None:
         """重绘动态区：流式正文 + 执行中工具行（可多个）/ "Imagining… (Ns · 第 N 轮)"。"""
         widget = self.query_one("#streaming", Static)  # type: ignore[attr-defined]
+        if self.state is SessionState.APPROVING:
+            if self.pending is not None:
+                widget.update(approval_block(self.pending, self.approve_cursor))
+                widget.display = True
+            return
         if self.state is not SessionState.STREAMING:
             widget.display = False
             return
@@ -154,6 +178,36 @@ class StreamMixin:
         else:
             widget.update(waiting)
         widget.display = True
+
+    def update_approving(self, key: str) -> None:
+        """APPROVING 态按键分派（F8）：↑↓/回车/数字键/便捷键，回传 Outcome。"""
+        if self.pending is None:
+            return
+        if key in ("up", "k"):
+            self.approve_cursor = (self.approve_cursor - 1) % 3
+            self._refresh_streaming_view()
+        elif key in ("down", "j"):
+            self.approve_cursor = (self.approve_cursor + 1) % 3
+            self._refresh_streaming_view()
+        elif key == "enter":
+            self._submit_approval(self.approve_cursor)
+        elif key in ("1", "2", "3"):
+            self._submit_approval(int(key) - 1)
+        elif key == "y":
+            self._submit_approval(0)
+        elif key in ("n", "d"):
+            self._submit_approval(2)
+
+    def _submit_approval(self, index: int) -> None:
+        """提交人在回路选择：回传 Outcome、清 pending、回 STREAMING 让 agent 续跑。"""
+        req = self.pending
+        if req is None:
+            return
+        self.pending = None
+        self.approve_cursor = 0
+        self.state = SessionState.STREAMING
+        req.respond.set_result(outcome_for_index(index))
+        self._refresh_streaming_view()
 
     def _finish_turn(self, reply: str) -> None:
         """正常结束：最终答复 markdown 定型追加到对话区，回到 IDLE。

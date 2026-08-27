@@ -10,6 +10,8 @@ from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
 
+from ..permission import Mode
+
 # 结果摘要在界面上的行数上限（N5：与回灌给模型的截断相互独立）
 _RESULT_SUMMARY_LINES = 8
 
@@ -20,6 +22,7 @@ class SessionState(Enum):
     SELECTING = "selecting"  # 多 provider 时的选择界面
     IDLE = "idle"  # 等待用户输入
     STREAMING = "streaming"  # 等待/接收模型流（loading + 计时）
+    APPROVING = "approving"  # 等待用户在人在回路菜单上做选择（F8）
 
 
 @dataclass
@@ -38,33 +41,61 @@ def _fmt_tokens(n: int) -> str:
 
 
 def statusbar_content(
-    name: str | None,
+    mode: Mode,
     model: str | None,
-    plan_mode: bool = False,
     usage_in: int = 0,
     usage_out: int = 0,
 ) -> RenderableType:
-    """底部状态栏：左侧 provider 名（计划模式附 PLAN 徽标）、右侧累计用量 + 模型名。"""
+    """底部状态栏：左侧常驻显示当前权限模式（取代 provider 名）、右侧模型名 + 累计用量。"""
+    label, style = {
+        Mode.DEFAULT: ("DEFAULT", "green"),
+        Mode.ACCEPT_EDITS: ("ACCEPT EDITS", "green"),
+        Mode.PLAN: ("PLAN", "yellow"),
+        Mode.BYPASS: ("BYPASS", "red"),
+    }[mode]
+
     left = Text()
-    if plan_mode:
-        left.append("⏵⏵ plan mode on", style="bold green")
-    else:
-        left.append("⏵⏵ accept edits on", style="bold green")
-    if model:
-        left.append(f" ● {model}", style="cyan")
-    else:
-        left.append(" ● 请选择 provider", style="red")
-    left.append(f" ● {name or 'PotatoCode'}", style="dim")
+    left.append(f"⏵⏵ {label}", style=f"bold {style}")
 
     right = Text()
     if model:
-        # 会话累计计费 token（每轮输入/输出分别累加，F8）
-        right.append(f"↑{_fmt_tokens(usage_in)} ↓{_fmt_tokens(usage_out)} tokens", style="dim")
+        # 会话累计计费 token（每轮输入/输出分别累加，F8）+ 模型名
+        right.append(
+            f"{model} ● ↑{_fmt_tokens(usage_in)} ↓{_fmt_tokens(usage_out)} tokens", style="dim"
+        )
+    else:
+        right.append("请选择 provider", style="red")
+
     grid = Table.grid(expand=True)
     grid.add_column(justify="left", ratio=1)
     grid.add_column(justify="right", ratio=1)
     grid.add_row(left, right)
     return grid
+
+
+def approval_block(req, cursor: int) -> RenderableType:
+    """人在回路待批准块（F8）：工具名 + 参数 + 触发原因 + 三选菜单（光标高亮）。"""
+    title = Text()
+    title.append("● ", style="bold cyan")
+    title.append(f"{req.name}({req.args})", style="bold")
+
+    labels = ["允许本次", "永久允许（写入本地配置）", "拒绝本次"]
+    menu = Text()
+    for idx, label in enumerate(labels):
+        prefix = "> " if idx == cursor else "  "
+        style = "bold green" if idx == cursor else "dim"
+        menu.append(f"{prefix}{idx + 1}. {label}", style=style)
+        if idx < len(labels) - 1:
+            menu.append("\n")
+
+    return Group(
+        title,
+        Text(f"  {req.reason}", style="dim"),
+        Text(""),
+        Text("是否继续?", style="bold"),
+        menu,
+        Text("↑↓ 选择 · 回车确认 · Esc 取消", style="dim"),
+    )
 
 
 def user_block(text: str) -> RenderableType:

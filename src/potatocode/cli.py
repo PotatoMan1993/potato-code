@@ -6,8 +6,9 @@ banner 由 TUI 在 on_mount 时写入对话区（见 tui/app.py），此处不�
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
-from . import __version__, config
+from . import __version__, config, permission
 from .config import ConfigError
 from .tool import new_default_registry
 from .tui import PotatoCodeApp
@@ -17,7 +18,7 @@ CONFIG_PATH = ".potatocode/config.yaml"
 
 
 def main() -> None:
-    """CLI 入口：加载并校验配置，启动 Textual 应用。"""
+    """CLI 入口：加载并校验配置，构造权限引擎，启动 Textual 应用。"""
     try:
         cfg = config.load(CONFIG_PATH)
     except ConfigError as e:
@@ -28,6 +29,11 @@ def main() -> None:
     try:
         # 注入默认工具注册中心（T17：agent 单轮闭环所需的 6 个工具）
         registry = new_default_registry()
-        PotatoCodeApp(cfg.providers, __version__, registry).run()
+        # 权限引擎（五层防御的前四层）：根于项目目录；解析失败仅降级提示、继续启动
+        root = str(Path.cwd().resolve())
+        engine, err = permission.new_engine(root)
+        if err is not None:
+            print(f"权限引擎降级: {err}", file=sys.stderr)
+        PotatoCodeApp(cfg.providers, __version__, registry, engine).run()
     except KeyboardInterrupt:
         pass  # 终端层的 Ctrl+C，安静退出

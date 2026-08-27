@@ -26,7 +26,7 @@ def build_system_prompt() -> str:
     return assemble_system(fixed_modules() + optional_modules())
 
 
-# ASCII PotatoCode（一颗带表情的小土豆）
+# ASCII PotatoCode
 BANNER: str = r"""
     ██████╗  ██████╗ ████████╗ █████╗ ████████╗ ██████╗ 
     ██╔══██╗██╔═══██╗╚══██╔══╝██╔══██╗╚══██╔══╝██╔═══██╗

@@ -15,15 +15,22 @@ from textual.message import Message
 from textual.timer import Timer
 from textual.widgets import RichLog, Static, TextArea
 
-from ..agent import Mode
+from ..agent import ApprovalRequest
 from ..config import ProviderConfig
 from ..conversation import Conversation
 from ..llm import Provider, new_provider
+from ..permission import Mode, Outcome
+from ..permission.engine import Engine
 from ..prompt import EXECUTE_DIRECTIVE, render_banner
 from ..tool import Registry
 from .select import ProviderSelect
 from .stream import StreamMixin
 from .view import SessionState, ToolDisplay, notice_block, statusbar_content, user_block
+
+
+def next_mode(mode: Mode) -> Mode:
+    """循环切换权限模式：DEFAULT → ACCEPT_EDITS → PLAN → BYPASS → DEFAULT（F7）。"""
+    return Mode((int(mode) + 1) % 4)
 
 
 class ChatSubmitted(Message):
@@ -47,6 +54,19 @@ class ChatTextArea(TextArea):
     ]
 
     async def _on_key(self, event: events.Key) -> None:
+        app = self.app
+        if isinstance(app, PotatoCodeApp):
+            if app.state is SessionState.APPROVING:
+                # 人在回路菜单键：↑↓/回车/数字键/y/n 都交给 update_approving 分派
+                app.update_approving(event.key)
+                event.stop()
+                event.prevent_default()
+                return
+            if event.key == "shift+tab" and app.state is SessionState.IDLE:
+                event.stop()
+                event.prevent_default()
+                app.action_cycle_mode()
+                return
         if event.key == "enter":
             # Enter：提交当前文本（拦截默认换行）
             event.stop()
@@ -146,23 +166,32 @@ class PotatoCodeApp(StreamMixin, App):
         Binding("escape", "cancel_turn", "Cancel turn", show=False),
     ]
 
-    def __init__(self, providers: list[ProviderConfig], version: str, registry: Registry) -> None:
+    def __init__(
+        self,
+        providers: list[ProviderConfig],
+        version: str,
+        registry: Registry,
+        engine: Engine,
+    ) -> None:
         super().__init__()
         self.providers = providers
         self._version = version
         # 注意：不能用 `_registry`——Textual App 内部已占用该名字（AppRegistry）
         self._tool_registry = registry
+        self.engine = engine  # 权限引擎（前四层），模式切换只影响后续兜底裁决
         self.provider: Provider | None = None
         self.conv = Conversation()
         self.state = SessionState.IDLE
         self.cur_reply = ""
         self.turn_start = 0.0
-        self.mode: Mode = Mode.NORMAL  # 当前模式，/plan /do 切换，跨轮保持（F10）
+        self.mode: Mode = engine.start_mode()  # 当前权限模式，Shift+Tab /plan /do 切换，跨轮保持
         self.iter = 0  # 当前迭代轮次（进度显示，F9）
         self.usage_in = 0  # 会话累计输入 token（F8）
         self.usage_out = 0  # 会话累计输出 token（F8）
         self.cur_tools: list[ToolDisplay] = []  # 执行中工具指示（并发批可多个，F5/N2）
         self.turn_cancel: asyncio.Event | None = None  # 本轮取消事件（F7）
+        self.pending: ApprovalRequest | None = None  # 待批准请求（APPROVING 态）
+        self.approve_cursor: int = 0  # 待批准菜单光标（0/1/2）
         self._stream_task: asyncio.Task | None = None
         self._timer: Timer | None = None
 
@@ -214,20 +243,17 @@ class PotatoCodeApp(StreamMixin, App):
         self.query_one(ChatTextArea).focus()
 
     def _update_statusbar(self) -> None:
-        """刷新底部状态栏：左侧 provider 名 + 模式徽标、右侧累计用量 + 模型名。"""
+        """刷新底部状态栏：左侧常驻权限模式、右侧模型名 + 累计用量。"""
         bar = self.query_one("#statusbar", Static)
-        if self.provider is None:
-            bar.update(statusbar_content(None, None))
-        else:
-            bar.update(
-                statusbar_content(
-                    self.provider.name,
-                    self.provider.model,
-                    plan_mode=self.mode is Mode.PLAN,
-                    usage_in=self.usage_in,
-                    usage_out=self.usage_out,
-                )
+        model = self.provider.model if self.provider is not None else None
+        bar.update(
+            statusbar_content(
+                self.mode,
+                model,
+                usage_in=self.usage_in,
+                usage_out=self.usage_out,
             )
+        )
 
     # ────────────────────── 事件处理 ──────────────────────
 
@@ -264,9 +290,9 @@ class PotatoCodeApp(StreamMixin, App):
             self._update_statusbar()
             return
         if text == "/do":
-            # 切回全工具模式，注入执行指令立即按上文计划开跑（/do 本身不入历史）
+            # 切回 default 模式，注入执行指令立即按上文计划开跑（/do 本身不入历史）
             input_box.clear()
-            self.mode = Mode.NORMAL
+            self.mode = Mode.DEFAULT
             self._update_statusbar()
             self.conv.add_user(EXECUTE_DIRECTIVE)
             self.query_one("#log", RichLog).write(user_block(EXECUTE_DIRECTIVE))
@@ -293,16 +319,38 @@ class PotatoCodeApp(StreamMixin, App):
     # ────────────────────── 取消与退出 ──────────────────────
 
     def action_cancel_or_quit(self) -> None:
-        """Ctrl+C：流式态取消本轮（不退出程序）；空闲态退出程序（F7/AC10）。"""
-        if self.state is SessionState.STREAMING and self.turn_cancel is not None:
+        """Ctrl+C：流式/待批准态取消本轮（不退出程序）；空闲态退出程序（F7/AC10）。"""
+        if self.state is SessionState.APPROVING:
+            self._cancel_approval()
+        elif self.state is SessionState.STREAMING and self.turn_cancel is not None:
             self.turn_cancel.set()
         else:
             self.exit()
 
     def action_cancel_turn(self) -> None:
-        """Esc：流式态取消本轮；其余状态忽略（F7/AC10）。"""
-        if self.state is SessionState.STREAMING and self.turn_cancel is not None:
+        """Esc：流式/待批准态取消本轮；其余状态忽略（F7/AC10）。"""
+        if self.state is SessionState.APPROVING:
+            self._cancel_approval()
+        elif self.state is SessionState.STREAMING and self.turn_cancel is not None:
             self.turn_cancel.set()
+
+    def _cancel_approval(self) -> None:
+        """人在回路等待中取消本轮（N4）：先兜底解开 agent 等待，再触发取消收尾。"""
+        if self.pending is not None:
+            self.pending.respond.set_result(Outcome.DENY_ONCE)
+        self.pending = None
+        self.state = SessionState.STREAMING
+        if self.turn_cancel is not None:
+            self.turn_cancel.set()
+        self._refresh_streaming_view()
+
+    def action_cycle_mode(self) -> None:
+        """Shift+Tab：循环切换权限模式（仅 idle 态生效），跨轮保持（F7）。"""
+        if self.state is not SessionState.IDLE:
+            return
+        self.mode = next_mode(self.mode)
+        self._update_statusbar()
+        self.query_one("#log", RichLog).write(notice_block(f"已切换到 {self.mode} 模式"))
 
     async def action_quit(self) -> None:
         """安全退出：先取消进行中的流式 task，再退出应用（还原终端）。"""

@@ -10,9 +10,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from enum import Enum, IntEnum
+from enum import Enum
 from typing import cast
 
 from .. import prompt
@@ -27,7 +28,11 @@ from ..llm import (
     ToolResult,
 )
 from ..llm import Usage as LlmUsage
+from ..permission import Decision, Mode, Outcome
+from ..permission.engine import Engine
 from ..tool import DEFAULT_TIMEOUT, Registry
+
+logger = logging.getLogger(__name__)
 
 # 工具行 / 结果摘要里展示的参数预览最大长度
 _ARGS_PREVIEW_LIMIT = 80
@@ -56,11 +61,14 @@ class Phase(Enum):
     END = "end"
 
 
-class Mode(IntEnum):
-    """运行模式：NORMAL 全工具；PLAN 仅只读工具 + 按轮次注入计划态提醒（F7/F10）。"""
+@dataclass
+class ApprovalRequest:
+    """一次待批准的工具调用（F8）：agent 发此事件后 await respond 等用户决策。"""
 
-    NORMAL = 0
-    PLAN = 1
+    name: str  # 工具内部名（用于展示 ● name(args)）
+    args: str  # 参数预览
+    reason: str  # 触发 Ask 的原因（模式 + 类别）
+    respond: asyncio.Future[Outcome]  # 单次未来量：TUI 回传用户选择
 
 
 @dataclass
@@ -90,6 +98,7 @@ class Event:
 
     text: str = ""  # 模型文本增量（preamble 或最终答复）
     tool: ToolEvent | None = None  # 工具调用开始/结束
+    approval: ApprovalRequest | None = None  # 待批准的工具调用（人在回路，F8）
     usage: Usage | None = None  # 本轮 token 用量（每轮 stream 结束后一次）
     iter: int = 0  # >0：进入第 iter 轮迭代（进度提示，F9）
     notice: str = ""  # 系统提示（停止原因等），仅用于 UI 展示，不入对话历史
@@ -147,10 +156,17 @@ class Agent:
     `cancel` 由调用方持有，触发 `cancel.set()` 即中断本轮。
     """
 
-    def __init__(self, provider: Provider, registry: Registry, version: str = "") -> None:
+    def __init__(
+        self,
+        provider: Provider,
+        registry: Registry,
+        engine: Engine,
+        version: str = "",
+    ) -> None:
         self._provider = provider
         self._registry = registry
         self._version = version
+        self.engine = engine  # 权限引擎：前四层判定，实际运行由 cli/tui 注入
 
     async def run(
         self,
@@ -162,7 +178,7 @@ class Agent:
         # 每次 run 起始采集环境、装配稳定系统提示（普通/规划一致；规划提醒已移出系统通道）
         env_text = prompt.gather_environment(self._version, self._provider.model).render()
         sys = prompt.build_system_prompt()
-        if mode is Mode.PLAN:
+        if mode == Mode.PLAN:
             defs = self._registry.read_only_definitions()
         else:
             defs = self._registry.definitions()
@@ -176,7 +192,7 @@ class Agent:
 
             # 规划模式按轮次注入 reminder：首轮完整、间隔轮完整、其余精简（F7）
             reminder = ""
-            if mode is Mode.PLAN:
+            if mode == Mode.PLAN:
                 full = it == 1 or (it - 1) % PLAN_REMINDER_INTERVAL == 0
                 reminder = prompt.plan_reminder(full)
 
@@ -225,12 +241,23 @@ class Agent:
 
             results: list[ToolResult] = []
             completed = True
-            async for batch_item in self._execute_batched(outcome.calls, cancel):
-                if isinstance(batch_item, _BatchOutcome):  # 该批次所有工具的执行结果
-                    results = batch_item.results
-                    completed = batch_item.completed
-                else:  # 单个工具的执行结果Event
-                    yield batch_item
+            try:
+                async for batch_item in self._execute_batched(outcome.calls, mode, cancel):
+                    if isinstance(batch_item, _BatchOutcome):  # 该批次所有工具的执行结果
+                        results = batch_item.results
+                        completed = batch_item.completed
+                    else:  # 单个工具的执行结果 Event（含 ApprovalRequest）
+                        yield batch_item
+            except asyncio.CancelledError:
+                # 人在回路等待中被 task.cancel()：补齐「已取消」结果 + assistant 尾巴，
+                # 保持历史配对合法（N4），generator 终结即本轮结束。
+                results = [
+                    ToolResult(tool_call_id=c.id, content=NOTICE_CANCELLED, is_error=True)
+                    for c in outcome.calls
+                ]
+                conv.add_tool_results(results)
+                self._finish_cancelled(conv)
+                raise
 
             conv.add_tool_results(results)  # 无条件回灌（含已取消占位，F6）
 
@@ -304,12 +331,14 @@ class Agent:
     async def _execute_batched(
         self,
         calls: list[ToolCall],
+        mode: Mode,
         cancel: asyncio.Event,
     ) -> AsyncIterator[Event | _BatchOutcome]:
-        """保序分批执行（F5）：连续只读合并为并发批，有副作用单个串行，保持调用序。
+        """保序分批执行（F5/F6）：连续只读合并为并发批，有副作用单个串行，保持调用序。
 
-        事件时序：每批先按序发 PHASE_START → 执行 → 再按序发 PHASE_END，
-        即「开始事件按序、结束事件按序」，并发只发生在执行环节（N3）。
+        每个工具执行前先过权限引擎（前四层）：Allow 执行、Deny 产被拒结果、
+        Ask 发 ApprovalRequest 事件并 await 用户决策（第五层，F8）。
+        事件时序：每批先按序发 PHASE_START → 执行 → 再按序发 PHASE_END。
         """
         n = len(calls)
         results: list[ToolResult | None] = [None] * n
@@ -325,14 +354,46 @@ class Agent:
                 return
 
             if self._registry.is_read_only(calls[i].name):
-                # 向前吃连续只读的最长区间 [i, j)
+                # 向前吃连续只读的最长区间 [i, j)；只读批逐个 check，Deny 预置、Allow 并发
                 j = i
                 while j < n and self._registry.is_read_only(calls[j].name):
                     j += 1
-            else:
-                j = i + 1  # 有副作用：单独串行
 
-            for k in range(i, j):  # 按模型输出的工具顺序显示工具执行预览
+                allow_indices: list[int] = []
+                for k in range(i, j):  # 按模型输出的工具顺序显示工具执行预览
+                    yield Event(
+                        tool=ToolEvent(
+                            name=calls[k].name,
+                            args=_preview(calls[k].input),
+                            phase=Phase.START,
+                        )
+                    )
+                    decision, reason = self.engine.check(mode, calls[k], True)
+                    if decision is Decision.DENY:
+                        results[k] = ToolResult(
+                            tool_call_id=calls[k].id, content=reason, is_error=True
+                        )
+                    else:
+                        allow_indices.append(k)  # 只读永不 Ask，此处必为 Allow
+
+                completed = await self._run_batch(calls, allow_indices, results, cancel)
+
+                for k in range(i, j):  # 按模型输出的工具顺序显示工具执行结果
+                    r = results[k]
+                    assert r is not None  # 每个下标都被 Deny 预置或 _run_batch 填充
+                    yield Event(
+                        tool=ToolEvent(
+                            name=calls[k].name,
+                            args=_preview(calls[k].input),
+                            phase=Phase.END,
+                            result=r.content,
+                            is_error=r.is_error,
+                        )
+                    )
+            else:
+                # 有副作用：单独串行
+                j = i + 1
+                k = i
                 yield Event(
                     tool=ToolEvent(
                         name=calls[k].name,
@@ -340,12 +401,41 @@ class Agent:
                         phase=Phase.START,
                     )
                 )
+                decision, reason = self.engine.check(mode, calls[k], False)
 
-            completed = await self._run_batch(calls, i, j, results, cancel)
+                if decision is Decision.ALLOW:
+                    completed = await self._run_batch(calls, [k], results, cancel)
+                elif decision is Decision.DENY:
+                    results[k] = ToolResult(tool_call_id=calls[k].id, content=reason, is_error=True)
+                    completed = True
+                else:
+                    # 第五层人在回路（F8）：发事件 → await 用户决策
+                    respond: asyncio.Future[Outcome] = asyncio.get_running_loop().create_future()
+                    yield Event(
+                        approval=ApprovalRequest(
+                            name=calls[k].name,
+                            args=_preview(calls[k].input),
+                            reason=reason,
+                            respond=respond,
+                        )
+                    )
+                    outcome = await respond
+                    if outcome is Outcome.ALLOW_FOREVER:
+                        try:
+                            self.engine.persist_local_allow(calls[k])
+                        except Exception as e:  # 持久化失败不阻断执行
+                            logger.warning("写入本地规则失败: %s", e)
+                        completed = await self._run_batch(calls, [k], results, cancel)
+                    elif outcome is Outcome.ALLOW_ONCE:
+                        completed = await self._run_batch(calls, [k], results, cancel)
+                    else:  # DENY_ONCE
+                        results[k] = ToolResult(
+                            tool_call_id=calls[k].id, content=reason, is_error=True
+                        )
+                        completed = True
 
-            for k in range(i, j):  # 按照模型输出的工具顺序来显示工具执行结果
                 r = results[k]
-                assert r is not None  # _run_batch 保证区间内每个下标都已填充
+                assert r is not None
                 yield Event(
                     tool=ToolEvent(
                         name=calls[k].name,
@@ -372,20 +462,21 @@ class Agent:
     async def _run_batch(
         self,
         calls: list[ToolCall],
-        start: int,
-        end: int,
+        indices: list[int],
         results: list[ToolResult | None],
         cancel: asyncio.Event,
     ) -> bool:
-        """并发执行区间 [start, end) 内的调用（长度 1 退化为串行）。
+        """并发执行 indices 指定的调用（长度 1 退化为串行）。
 
         每个 task 只写自己下标 results[k]（asyncio 单线程模型下无需锁，N6）；
         每个工具仍受 per-tool 超时约束（N1，沿用 Registry.execute）。
         cancel 触发时尽快取消未完成的工具任务并填「已取消」结果。
         返回该批是否全部完成（False 表示执行中被取消）。
         """
+        if not indices:
+            return True  # 全部被 Deny，无并发任务
         tasks: dict[asyncio.Task[ToolResult], int] = {
-            asyncio.create_task(self._run_tool(calls[k])): k for k in range(start, end)
+            asyncio.create_task(self._run_tool(calls[k])): k for k in indices
         }
         cancel_task = asyncio.create_task(cancel.wait())
         pending: set[asyncio.Task[ToolResult]] = set(tasks)  # 只跟踪工具任务
@@ -410,7 +501,7 @@ class Agent:
             cancel_task.cancel()  # 无泄漏：不残留监听任务（N5）
 
         if cancel.is_set():
-            for k in range(start, end):
+            for k in indices:
                 if results[k] is None:
                     results[k] = ToolResult(
                         tool_call_id=calls[k].id, content=NOTICE_CANCELLED, is_error=True
@@ -444,6 +535,7 @@ __all__ = [
     "NOTICE_UNKNOWN_TOOLS",
     "PLAN_REMINDER_INTERVAL",
     "Agent",
+    "ApprovalRequest",
     "Event",
     "Mode",
     "Phase",

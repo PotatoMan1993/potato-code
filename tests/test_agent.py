@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from collections.abc import AsyncIterator
+
+import pytest
 
 from potatocode.agent import (
     MAX_ITERATIONS,
@@ -25,7 +28,20 @@ from potatocode.agent import (
 from potatocode.conversation import Conversation
 from potatocode.llm import Request, StreamEvent, System, ToolCall, ToolDefinition
 from potatocode.llm import Usage as LlmUsage
+from potatocode.permission import Outcome, new_engine
+from potatocode.permission.engine import Engine
 from potatocode.tool import Registry, Result, _parse_args, new_default_registry
+
+
+def _engine(root: str | None = None) -> Engine:
+    """构造一个根于 root（默认 cwd）的权限引擎，供 Agent 注入。"""
+    engine, _ = new_engine(root or os.getcwd())
+    return engine
+
+
+def _make_agent(provider, registry: Registry, root: str | None = None) -> Agent:
+    """构造带权限引擎的 Agent（默认根 cwd；写 tmp_path 的用例传 root=str(tmp_path)）。"""
+    return Agent(provider, registry, _engine(root))
 
 
 class FakeProvider:
@@ -90,13 +106,23 @@ def _turn_with_tools(*calls: ToolCall) -> list[StreamEvent]:
 async def _collect(
     agent: Agent,
     conv: Conversation,
-    mode: Mode = Mode.NORMAL,
+    mode: Mode = Mode.DEFAULT,
     cancel: asyncio.Event | None = None,
 ) -> list[Event]:
-    """异步消费 agent.run 事件流（默认普通模式、不取消）。"""
+    """异步消费 agent.run 事件流（默认普通模式、不取消）。
+
+    遇到 ApprovalRequest 自动以 ALLOW_ONCE 放行——这些「机制」用例不关心权限，
+    避免 default 模式下写文件/未知工具触发人在回路而挂起。
+    """
     if cancel is None:
         cancel = asyncio.Event()
-    return [ev async for ev in agent.run(conv, mode, cancel)]
+    events: list[Event] = []
+    async for ev in agent.run(conv, mode, cancel):
+        if ev.approval is not None:
+            ev.approval.respond.set_result(Outcome.ALLOW_ONCE)
+            continue
+        events.append(ev)
+    return events
 
 
 # ────────── 场景 A：多轮自动连环（AC1/AC2/F1/F4/F6/F8） ──────────
@@ -132,7 +158,7 @@ async def test_multi_round_tool_chain(tmp_path):
             ],
         ]
     )
-    agent = Agent(provider, reg)
+    agent = _make_agent(provider, reg, root=str(tmp_path))
     conv = Conversation()
     conv.add_user("读 pyproject.toml 并写一份摘要")
 
@@ -186,7 +212,7 @@ async def test_multi_round_tool_chain(tmp_path):
 async def test_natural_completion_empty_text():
     """模型回复无文本无工具：以占位文本收尾，避免空 assistant 回合。"""
     provider = FakeProvider(scripts=[[StreamEvent(done=True)]])
-    agent = Agent(provider, new_default_registry())
+    agent = _make_agent(provider, new_default_registry())
     conv = Conversation()
     conv.add_user("hi")
 
@@ -208,7 +234,7 @@ async def test_max_iterations_stop():
             StreamEvent(done=True),
         ]
     )
-    agent = Agent(provider, new_default_registry())
+    agent = _make_agent(provider, new_default_registry())
     conv = Conversation()
     conv.add_user("一直读")
 
@@ -232,7 +258,7 @@ def _unknown_turn() -> list[StreamEvent]:
 async def test_unknown_tools_stop():
     """AC4：连续 MAX_UNKNOWN_RUN 轮只请求未注册工具即停并提示。"""
     provider = FakeProvider(repeat=_unknown_turn())
-    agent = Agent(provider, new_default_registry())
+    agent = _make_agent(provider, new_default_registry())
     conv = Conversation()
     conv.add_user("用你的魔法工具")
 
@@ -259,7 +285,7 @@ async def test_unknown_tools_counter_reset_by_known():
             _unknown_turn(),  # r5：unknown_run=3 → 停
         ]
     )
-    agent = Agent(provider, new_default_registry())
+    agent = _make_agent(provider, new_default_registry())
     conv = Conversation()
     conv.add_user("混合调用")
 
@@ -345,7 +371,7 @@ async def test_concurrent_batch_order_preserved():
             [StreamEvent(text="完成。"), StreamEvent(done=True)],
         ]
     )
-    agent = Agent(provider, reg)
+    agent = _make_agent(provider, reg)
     conv = Conversation()
     conv.add_user("三步任务")
 
@@ -394,7 +420,7 @@ async def test_read_only_batch_of_one_still_works():
             [StreamEvent(text="完成。"), StreamEvent(done=True)],
         ]
     )
-    agent = Agent(provider, reg)
+    agent = _make_agent(provider, reg)
     conv = Conversation()
     conv.add_user("单步")
 
@@ -439,7 +465,7 @@ async def test_cancel_during_execution_keeps_history_valid():
             [StreamEvent(text="我回来了。"), StreamEvent(done=True)],
         ]
     )
-    agent = Agent(provider, reg)
+    agent = _make_agent(provider, reg)
     conv = Conversation()
     conv.add_user("慢任务")
 
@@ -447,7 +473,7 @@ async def test_cancel_during_execution_keeps_history_valid():
     events: list[Event] = []
 
     async def first_turn() -> None:
-        async for ev in agent.run(conv, Mode.NORMAL, cancel):
+        async for ev in agent.run(conv, Mode.DEFAULT, cancel):
             events.append(ev)
 
     task = asyncio.create_task(first_turn())
@@ -481,7 +507,7 @@ async def test_cancel_during_execution_keeps_history_valid():
 async def test_cancel_before_stream_starts():
     """流开始前就取消：不发请求，历史以「已取消」收尾。"""
     provider = FakeProvider(scripts=[[StreamEvent(text="不该出现"), StreamEvent(done=True)]])
-    agent = Agent(provider, new_default_registry())
+    agent = _make_agent(provider, new_default_registry())
     conv = Conversation()
     conv.add_user("还没开始就取消")
 
@@ -501,7 +527,7 @@ async def test_cancel_before_stream_starts():
 async def test_plan_mode_read_only_tools_and_reminder():
     """AC13/F7：PLAN 模式只注入只读工具定义 + 首轮注入完整 reminder。"""
     provider = FakeProvider(scripts=[[StreamEvent(text="计划：第一步…"), StreamEvent(done=True)]])
-    agent = Agent(provider, new_default_registry())
+    agent = _make_agent(provider, new_default_registry())
     conv = Conversation()
     conv.add_user("给登录功能加单测的方案")
 
@@ -521,7 +547,7 @@ async def test_plan_mode_read_only_tools_and_reminder():
 async def test_normal_mode_full_tools_and_no_reminder():
     """对照：NORMAL 模式注入全部 6 个工具、不注入 reminder。"""
     provider = FakeProvider(scripts=[[StreamEvent(text="好"), StreamEvent(done=True)]])
-    agent = Agent(provider, new_default_registry())
+    agent = _make_agent(provider, new_default_registry())
     conv = Conversation()
     conv.add_user("hi")
 
@@ -550,7 +576,7 @@ async def test_stream_error_stops_turn_and_recovers():
             [StreamEvent(text="恢复了。"), StreamEvent(done=True)],
         ]
     )
-    agent = Agent(provider, new_default_registry())
+    agent = _make_agent(provider, new_default_registry())
     conv = Conversation()
     conv.add_user("第一条会失败")
 
@@ -590,7 +616,7 @@ async def test_plan_mode_reminder_full_then_concise():
             [StreamEvent(text="计划完成。"), StreamEvent(done=True)],
         ]
     )
-    agent = Agent(provider, new_default_registry())
+    agent = _make_agent(provider, new_default_registry())
     conv = Conversation()
     conv.add_user("调研项目结构")
 
@@ -607,13 +633,13 @@ async def test_plan_mode_reminder_full_then_concise():
 async def test_stable_system_same_across_modes():
     """F7/N1：普通与规划模式 `req.system.stable` 相同（规划提醒已移出系统通道）。"""
     p1 = FakeProvider(scripts=[[StreamEvent(text="x"), StreamEvent(done=True)]])
-    a1 = Agent(p1, new_default_registry())
+    a1 = _make_agent(p1, new_default_registry())
     c1 = Conversation()
     c1.add_user("hi")
-    await _collect(a1, c1, mode=Mode.NORMAL)
+    await _collect(a1, c1, mode=Mode.DEFAULT)
 
     p2 = FakeProvider(scripts=[[StreamEvent(text="x"), StreamEvent(done=True)]])
-    a2 = Agent(p2, new_default_registry())
+    a2 = _make_agent(p2, new_default_registry())
     c2 = Conversation()
     c2.add_user("hi")
     await _collect(a2, c2, mode=Mode.PLAN)
@@ -626,7 +652,7 @@ async def test_stable_system_same_across_modes():
 async def test_reminder_not_in_conversation_history():
     """AC8/N3：reminder 每轮动态构造、不写入持久对话历史。"""
     provider = FakeProvider(scripts=[[StreamEvent(text="计划。"), StreamEvent(done=True)]])
-    agent = Agent(provider, new_default_registry())
+    agent = _make_agent(provider, new_default_registry())
     conv = Conversation()
     conv.add_user("做个计划")
 
@@ -655,7 +681,7 @@ async def test_cache_usage_passthrough():
             ]
         ]
     )
-    agent = Agent(provider, new_default_registry())
+    agent = _make_agent(provider, new_default_registry())
     conv = Conversation()
     conv.add_user("hi")
 
@@ -666,3 +692,206 @@ async def test_cache_usage_passthrough():
     assert (usages[0].input, usages[0].output) == (10, 5)
     assert usages[0].cache_write == 30
     assert usages[0].cache_read == 40
+
+
+# ────────── 场景 I：权限集成（ch06：Deny 回灌 / 保序 / 人在回路 / 取消） ──────────
+
+
+async def test_deny_feedback_loop_continues(tmp_path):
+    """AC11/F9：被拒工具调用回灌错误结果，Agent Loop 继续到次轮。"""
+    eng = _engine(str(tmp_path))
+    provider = FakeProvider(
+        scripts=[
+            _turn_with_tools(ToolCall(id="x", name="read_file", input='{"path": "/etc/passwd"}')),
+            [StreamEvent(text="换个项目内路径"), StreamEvent(done=True)],
+        ]
+    )
+    agent = Agent(provider, new_default_registry(), eng)
+    conv = Conversation()
+    conv.add_user("读一个文件")
+
+    events = await _collect(agent, conv)
+
+    tool_evs = [e.tool for e in events if e.tool is not None]
+    assert tool_evs[1].is_error
+    assert "路径在项目目录之外" in tool_evs[1].result
+    assert events[-1].done
+    assert conv.messages()[-1].content == "换个项目内路径"
+
+
+async def test_mixed_batch_deny_and_allow_order(tmp_path):
+    """AC11/F9/N3：单批含「被拒 + 放行」按调用序、各自调用 ID 配对回灌，不串位。"""
+    eng = _engine(str(tmp_path))
+    provider = FakeProvider(
+        scripts=[
+            _turn_with_tools(
+                ToolCall(id="x", name="read_file", input='{"path": "/etc/passwd"}'),
+                ToolCall(id="x", name="read_file", input='{"path": "pyproject.toml"}'),
+            ),
+            [StreamEvent(text="完成"), StreamEvent(done=True)],
+        ]
+    )
+    agent = Agent(provider, new_default_registry(), eng)
+    conv = Conversation()
+    conv.add_user("混合批")
+
+    events = await _collect(agent, conv)
+
+    results = conv.messages()[2].tool_results
+    assert results[0].is_error and "路径在项目目录之外" in results[0].content
+    assert not results[1].is_error
+    assert [r.tool_call_id for r in results] == [c.id for c in conv.messages()[1].tool_calls]
+    assert events[-1].done
+
+
+async def test_ask_approval_allow_once(tmp_path):
+    """AC10/F8：default 下写文件触发 ApprovalRequest，选「允许本次」→ 执行。"""
+    eng = _engine(str(tmp_path))
+    target = tmp_path / "out.txt"
+    provider = FakeProvider(
+        scripts=[
+            _turn_with_tools(
+                ToolCall(
+                    id="x",
+                    name="write_file",
+                    input=json.dumps({"path": str(target), "content": "hi"}),
+                )
+            ),
+            [StreamEvent(text="写好了"), StreamEvent(done=True)],
+        ]
+    )
+    agent = Agent(provider, new_default_registry(), eng)
+    conv = Conversation()
+    conv.add_user("写文件")
+
+    approvals = []
+    events = []
+    async for ev in agent.run(conv, Mode.DEFAULT, asyncio.Event()):
+        if ev.approval is not None:
+            approvals.append(ev.approval)
+            ev.approval.respond.set_result(Outcome.ALLOW_ONCE)
+        else:
+            events.append(ev)
+
+    assert len(approvals) == 1
+    assert approvals[0].name == "write_file"
+    assert "需确认" in approvals[0].reason
+    assert target.read_text(encoding="utf-8") == "hi"
+    assert events[-1].done
+
+
+async def test_ask_approval_deny_once(tmp_path):
+    """AC10/F8：选「拒绝本次」→ 回灌被拒、不执行。"""
+    eng = _engine(str(tmp_path))
+    target = tmp_path / "out.txt"
+    provider = FakeProvider(
+        scripts=[
+            _turn_with_tools(
+                ToolCall(
+                    id="x",
+                    name="write_file",
+                    input=json.dumps({"path": str(target), "content": "hi"}),
+                )
+            ),
+            [StreamEvent(text="换个做法"), StreamEvent(done=True)],
+        ]
+    )
+    agent = Agent(provider, new_default_registry(), eng)
+    conv = Conversation()
+    conv.add_user("写文件")
+
+    async for ev in agent.run(conv, Mode.DEFAULT, asyncio.Event()):
+        if ev.approval is not None:
+            ev.approval.respond.set_result(Outcome.DENY_ONCE)
+
+    assert not target.exists()  # 未执行
+    # 被拒结果回灌：tool 回合 is_error
+    results = conv.messages()[2].tool_results
+    assert results[0].is_error
+    assert "需确认" in results[0].content
+
+
+async def test_ask_approval_allow_forever(tmp_path):
+    """AC10/F8：选「永久」→ 执行并写本地层精确 allow 规则。"""
+    from pathlib import Path
+
+    eng = _engine(str(tmp_path))
+    provider = FakeProvider(
+        scripts=[
+            _turn_with_tools(ToolCall(id="x", name="bash", input='{"command": "echo ok"}')),
+            [StreamEvent(text="完成"), StreamEvent(done=True)],
+        ]
+    )
+    agent = Agent(provider, new_default_registry(), eng)
+    conv = Conversation()
+    conv.add_user("跑命令")
+
+    async for ev in agent.run(conv, Mode.DEFAULT, asyncio.Event()):
+        if ev.approval is not None:
+            ev.approval.respond.set_result(Outcome.ALLOW_FOREVER)
+
+    assert "Bash(echo ok)" in Path(eng.local_path).read_text(encoding="utf-8")
+
+
+async def test_read_only_batch_no_approval(tmp_path):
+    """AC13/N3：一批只读不产生 ApprovalRequest，且并发不退化。"""
+    eng = _engine(str(tmp_path))
+    reg, state = _probe_registry()
+    provider = FakeProvider(
+        scripts=[
+            _turn_with_tools(
+                ToolCall(id="x", name="probe_ro", input='{"tag": "a"}'),
+                ToolCall(id="x", name="probe_ro", input='{"tag": "b"}'),
+            ),
+            [StreamEvent(text="完成"), StreamEvent(done=True)],
+        ]
+    )
+    agent = Agent(provider, reg, eng)
+    conv = Conversation()
+    conv.add_user("并发只读")
+
+    approvals = []
+    async for ev in agent.run(conv, Mode.DEFAULT, asyncio.Event()):
+        if ev.approval is not None:
+            approvals.append(ev.approval)
+
+    assert not approvals
+    assert state["peak"] >= 2  # 只读仍并发执行
+
+
+async def test_cancel_during_approval(tmp_path):
+    """AC12/N4：人在回路等待中 task.cancel() → 干净收尾、历史合法、无挂起 task。"""
+    eng = _engine(str(tmp_path))
+    provider = FakeProvider(
+        scripts=[
+            _turn_with_tools(
+                ToolCall(
+                    id="x", name="write_file", input=json.dumps({"path": "x.txt", "content": "y"})
+                )
+            )
+        ]
+    )
+    agent = Agent(provider, new_default_registry(), eng)
+    conv = Conversation()
+    conv.add_user("写文件")
+
+    saw_approval = asyncio.Event()
+
+    async def drive() -> None:
+        async for ev in agent.run(conv, Mode.DEFAULT, asyncio.Event()):
+            if ev.approval is not None:
+                saw_approval.set()
+                continue  # 下一次 __anext__ 让 agent 卡在 await respond
+
+    task = asyncio.create_task(drive())
+    await asyncio.wait_for(saw_approval.wait(), timeout=2)
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+
+    # 历史合法：assistant(tool_use) → tool(已取消) → assistant(尾巴)
+    msgs = conv.messages()
+    assert msgs[-1].role == "assistant"
+    assert msgs[-1].content == NOTICE_CANCELLED
+    assert msgs[-2].role == "tool"

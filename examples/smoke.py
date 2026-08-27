@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from pathlib import Path
 
 from potatocode import config
-from potatocode.agent import Agent, Mode, Phase
+from potatocode.agent import Agent, Phase
 from potatocode.conversation import Conversation
 from potatocode.llm import new_provider
+from potatocode.permission import Mode, new_engine
 from potatocode.tool import new_default_registry
 
 CONFIG_PATH = ".potatocode/config.yaml"
@@ -26,7 +28,7 @@ async def run_turn(agent: Agent, conv: Conversation, msg: str) -> None:
     """发一条消息，消费一轮 Agent Loop 事件流，打印文本、工具与用量。"""
     conv.add_user(msg)
     print(f"\n=== user: {msg} ===")
-    async for ev in agent.run(conv, Mode.NORMAL, asyncio.Event()):
+    async for ev in agent.run(conv, Mode.BYPASS, asyncio.Event()):
         if ev.text:
             print(ev.text, end="", flush=True)
         if ev.tool is not None:
@@ -52,7 +54,9 @@ async def main() -> None:
     cfg = config.load(CONFIG_PATH)
     provider = new_provider(cfg.providers[0])
     registry = new_default_registry()
-    agent = Agent(provider, registry, version="dev")
+    # 非交互：以 BYPASS 运行（黑名单/沙箱仍在），避免阻塞在人在回路 Ask
+    engine, _ = new_engine(str(Path.cwd().resolve()))
+    agent = Agent(provider, registry, engine, version="dev")
     conv = Conversation()
 
     messages = sys.argv[1:] or ["你好，请用一句话介绍你自己。"]
