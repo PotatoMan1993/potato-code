@@ -1,0 +1,22 @@
+# PotatoCode 权限配置模板（ch06）
+# 复制为 .potatocode/settings.yaml（项目级）或 .potatocode/settings.local.yaml（本地级）使用。
+#
+# 三层配置文件（就近命中即止，本地 > 项目 > 用户）：
+#   ~/.potatocode/settings.yaml            用户级
+#   <project>/.potatocode/settings.yaml    项目级
+#   <project>/.potatocode/settings.local.yaml  本地级（人在回路「永久放行」写入，已被 gitignore）
+#
+# 规则以「友好工具名(模式)」声明：Bash/Read/Write/Edit/Glob/Grep。
+#   不带模式段（如 `Bash`）匹配该工具全部调用；`*` 任意串、`**` 仅文件路径跨段。
+#   deny 优先于 allow；黑名单不可在此放开。
+
+default_mode: default   # default / acceptEdits / plan / bypassPermissions（可选）
+
+permissions:
+  allow:
+    - "Bash(git *)"       # 提前放行所有 git 子命令
+    - "Bash(pytest)"      # 提前放行 pytest
+  deny:
+    - "Bash(rm *)"        # 拦截 rm 系列命令
+    - "Read(.env)"        # 拦截读取 .env（只读类默认即 Allow，deny 可对只读做围栏）
+    - "Write(.env)"       # 拦截写入 .env
