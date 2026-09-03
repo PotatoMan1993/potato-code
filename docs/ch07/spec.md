@@ -4,7 +4,7 @@
 
 potatocode 已经是一个能自主多轮干活、且有五层安全护栏的 coding agent。但**工具集是写死的 6 个内置工具**（读 / 写 / 改文件、命令执行、按模式找文件、搜内容）——想让它会用 GitHub、查数据库、调内部服务，只能改源码、重新打包，能力边界锁死在编译期。
 
-MCP（Model Context me JSON-RPC 协议把"提供工具的一方（server）"与"使用工具的一方（client）"解耦，社区已有大量现成 server（GitHub、Slack、SQLite、文件系统……）。给 potatocode 装上 **MCP 客户端**：启动时按配置自动发现并连接外部 server，把它们的工具包装成 potatocode 已有的工具抽象、注册进工具中心，Agent 调用时与内置工具**完全无感**，并自动复用已有的权限护栏。这是从"工具集固定"到"工具生态可插拔"的一跃——给 potatocode 装上扩展坞。
+MCP（Model Context Protocol）是一套开放标准，用统一的 JSON-RPC 协议把"提供工具的一方（server）"与"使用工具的一方（client）"解耦，社区已有大量现成 server（GitHub、Slack、SQLite、文件系统……）。给 potatocode 装上 **MCP 客户端**：启动时按配置自动发现并连接外部 server，把它们的工具包装成 potatocode 已有的工具抽象、注册进工具中心，Agent 调用时与内置工具**完全无感**，并自动复用已有的权限护栏。这是从"工具集固定"到"工具生态可插拔"的一跃——给 potatocode 装上扩展坞。
 
 ## 目标
 
