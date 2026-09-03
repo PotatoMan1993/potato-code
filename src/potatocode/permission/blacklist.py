@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 
 # 内置高危命令正则（不可配置，N1）。命中即 Deny，先于其余四层。
-_BLACKLIST: tuple[re.Pattern[str], ...] = (     # TODO 各个命令的作用
+_BLACKLIST: tuple[re.Pattern[str], ...] = (  # TODO 各个命令的作用
     # 递归强删根/家目录（及其变体 rm -rf /、rm -fr ~、rm -rf $HOME、rm -rf /*）
     re.compile(r"\brm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+(/|~|\$HOME|/\*|--no-preserve-root)"),
     # dd 写入块设备（of=/dev/...）

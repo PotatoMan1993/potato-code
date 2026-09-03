@@ -5,10 +5,11 @@ banner 由 TUI 在 on_mount 时写入对话区（见 tui/app.py），此处不�
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
-from . import __version__, config, permission
+from . import __version__, config, mcp, permission
 from .config import ConfigError
 from .tool import new_default_registry
 from .tui import PotatoCodeApp
@@ -17,23 +18,33 @@ from .tui import PotatoCodeApp
 CONFIG_PATH = ".potatocode/config.yaml"
 
 
-def main() -> None:
-    """CLI 入口：加载并校验配置，构造权限引擎，启动 Textual 应用。"""
+async def _amain() -> int:
+    """异步入口：让 MCP 会话覆盖完整的 TUI 生命周期。"""
     try:
         cfg = config.load(CONFIG_PATH)
     except ConfigError as e:
         # N4：可读错误提示，而非崩溃堆栈
         print(f"配置错误: {e}", file=sys.stderr)
-        sys.exit(1)
+        return 1
 
+    root = str(Path.cwd().resolve())
+    registry = new_default_registry()
+    manager = await mcp.new_manager(mcp.load_config(root), version=__version__)
     try:
-        # 注入默认工具注册中心（T17：agent 单轮闭环所需的 6 个工具）
-        registry = new_default_registry()
+        for remote_tool in manager.tools():
+            registry.register(remote_tool)
         # 权限引擎（五层防御的前四层）：根于项目目录；解析失败仅降级提示、继续启动
-        root = str(Path.cwd().resolve())
         engine, err = permission.new_engine(root)
         if err is not None:
             print(f"权限引擎降级: {err}", file=sys.stderr)
-        PotatoCodeApp(cfg.providers, __version__, registry, engine).run()
+        await PotatoCodeApp(cfg.providers, __version__, registry, engine).run_async()
     except KeyboardInterrupt:
         pass  # 终端层的 Ctrl+C，安静退出
+    finally:
+        await manager.close()
+    return 0
+
+
+def main() -> None:
+    """CLI 同步入口。"""
+    raise SystemExit(asyncio.run(_amain()))

@@ -104,11 +104,15 @@ class Engine:
         """跨三层匹配规则（F4/AC5）：deny 全层优先、allow 随后，层级先后不影响结果。"""
         for ruleset in (self.local, self.project, self.user):
             for rule in ruleset.deny:
-                if rule.tool == friendly and match_pattern(rule.pattern, target):
+                if match_pattern(rule.tool, friendly, path=False) and match_pattern(
+                    rule.pattern, target
+                ):
                     return Decision.DENY, rule
         for ruleset in (self.local, self.project, self.user):
             for rule in ruleset.allow:
-                if rule.tool == friendly and match_pattern(rule.pattern, target):
+                if match_pattern(rule.tool, friendly, path=False) and match_pattern(
+                    rule.pattern, target
+                ):
                     return Decision.ALLOW, rule
         return Decision.ALLOW, None
 
