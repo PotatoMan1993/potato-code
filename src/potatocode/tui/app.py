@@ -21,6 +21,7 @@ from ..conversation import Conversation
 from ..llm import Provider, new_provider
 from ..permission import Mode, Outcome
 from ..permission.engine import Engine
+from ..mcp import Manager
 from ..prompt import EXECUTE_DIRECTIVE, render_banner
 from ..tool import Registry
 from .select import ProviderSelect
@@ -172,6 +173,7 @@ class PotatoCodeApp(StreamMixin, App):
         version: str,
         registry: Registry,
         engine: Engine,
+        manager: Manager,
     ) -> None:
         super().__init__()
         self.providers = providers
@@ -179,6 +181,7 @@ class PotatoCodeApp(StreamMixin, App):
         # 注意：不能用 `_registry`——Textual App 内部已占用该名字（AppRegistry）
         self._tool_registry = registry
         self.engine = engine  # 权限引擎（前四层），模式切换只影响后续兜底裁决
+        self.manager = manager  # mcp manager
         self.provider: Provider | None = None
         self.conv = Conversation()
         self.state = SessionState.IDLE
@@ -216,7 +219,11 @@ class PotatoCodeApp(StreamMixin, App):
     def on_mount(self) -> None:
         """启动：写 banner；单 provider 直进对话，多 provider 进选择界面。"""
         log = self.query_one("#log", RichLog)
-        log.write(Text(render_banner(self._version, os.getcwd()), style="cyan"))
+        title = Text()
+        title.append(render_banner(self._version, os.getcwd()), style="cyan")
+        title.append(f"\n  Connected to {len(self.manager._sessions)} MCP server(s)", style="dim")
+        title.append(f", {len(self.manager._tools)} tools registered", style="dim")
+        log.write(title)
         self._update_statusbar()
 
         if len(self.providers) == 1:

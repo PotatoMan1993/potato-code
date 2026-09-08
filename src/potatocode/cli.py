@@ -37,7 +37,7 @@ async def _amain() -> int:
         engine, err = permission.new_engine(root)
         if err is not None:
             print(f"权限引擎降级: {err}", file=sys.stderr)
-        await PotatoCodeApp(cfg.providers, __version__, registry, engine).run_async()
+        await PotatoCodeApp(cfg.providers, __version__, registry, engine, manager).run_async()
     except KeyboardInterrupt:
         pass  # 终端层的 Ctrl+C，安静退出
     finally:
