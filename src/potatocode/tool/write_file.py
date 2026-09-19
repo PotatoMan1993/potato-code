@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from . import Result, _parse_args
+from .file_observation import FileObservation, text_version
 
 
 class WriteFileTool:
@@ -47,4 +48,9 @@ class WriteFileTool:
         except OSError as e:
             return Result(content=f"写入文件失败: {path}: {e}", is_error=True)
 
-        return Result(content=f"已写入 {path}（{len(content.encode('utf-8'))} 字节）")
+        return Result(
+            content=f"已写入 {path}（{len(content.encode('utf-8'))} 字节）",
+            file_observation=FileObservation(
+                path=str(p.resolve()), operation="write", source_version=text_version(content)
+            ),
+        )

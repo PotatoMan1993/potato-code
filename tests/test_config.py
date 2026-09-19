@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from potatocode.config import ConfigError, load
+from potatocode.llm import ContextLimits
 
 # 合法配置样例（两条 provider，覆盖各字段）
 VALID_YAML = """
@@ -129,3 +130,58 @@ providers:
 """
     with pytest.raises(ConfigError, match=r"providers\[1\]\.api_key 不能为空"):
         load(write_config(tmp_path, yaml_text))
+
+
+def test_context_defaults_preserve_unknown_window(tmp_path):
+    cfg = load(write_config(tmp_path, VALID_YAML)).providers[0]
+    assert cfg.context_window is None
+    assert cfg.max_output_tokens == 4096
+    assert cfg.compact_max_output_tokens == 20000
+    assert cfg.openai_output_limit_parameter == "max_completion_tokens"
+    with pytest.raises(ValueError, match="context_window"):
+        ContextLimits(cfg.context_window).validate()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("context_window", "true", "context_window"),
+        ("context_window", "33000", "context_window"),
+        ("context_window", '"128000"', "context_window"),
+        ("max_output_tokens", "false", "max_output_tokens"),
+        ("max_output_tokens", "128000", "max_output_tokens"),
+        ("max_output_tokens", "0", "max_output_tokens"),
+        ("compact_max_output_tokens", "20001", "compact_max_output_tokens"),
+        ("compact_max_output_tokens", "-1", "compact_max_output_tokens"),
+    ],
+)
+def test_invalid_budget_is_reported_before_request(tmp_path, field, value, message):
+    fields = {"context_window": "128000", field: value}
+    yaml_text = "providers:\n  - name: X\n    protocol: openai\n    api_key: fake\n    model: m\n"
+    yaml_text += "".join(f"    {key}: {item}\n" for key, item in fields.items())
+    cfg = load(write_config(tmp_path, yaml_text)).providers[0]
+    limits = ContextLimits(cfg.context_window, cfg.max_output_tokens, cfg.compact_max_output_tokens)
+    with pytest.raises(ValueError, match=message):
+        limits.validate()
+
+
+def test_explicit_context_configuration(tmp_path):
+    yaml_text = """providers:
+  - name: X
+    protocol: openai
+    api_key: fake
+    model: m
+    context_window: 128000
+    max_output_tokens: 1024
+    compact_max_output_tokens: 6000
+    openai_output_limit_parameter: max_tokens
+"""
+    cfg = load(write_config(tmp_path, yaml_text)).providers[0]
+    ContextLimits(
+        cfg.context_window, cfg.max_output_tokens, cfg.compact_max_output_tokens
+    ).validate()
+    assert cfg.openai_output_limit_parameter == "max_tokens"
+    with pytest.raises(ConfigError, match="openai_output_limit_parameter"):
+        load(
+            write_config(tmp_path, yaml_text.replace("parameter: max_tokens", "parameter: invalid"))
+        )

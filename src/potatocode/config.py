@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 import yaml
 
@@ -23,6 +23,12 @@ class ProviderConfig:
     model: str  # 模型名（状态栏右侧显示）
     base_url: str | None = None  # 自定义端点；None 则用 SDK 默认端点
     thinking: bool = False  # 是否开启扩展思考（仅 anthropic 生效）
+    context_window: int | None = None
+    max_output_tokens: int = 4096
+    compact_max_output_tokens: int = 20000
+    openai_output_limit_parameter: Literal["max_completion_tokens", "max_tokens"] = (
+        "max_completion_tokens"
+    )
 
 
 @dataclass
@@ -95,6 +101,12 @@ def _parse_provider(item: object, index: int) -> ProviderConfig:
     if not isinstance(thinking, bool):
         raise ConfigError(f"{prefix}.thinking 应为布尔值")
 
+    output_parameter = item.get("openai_output_limit_parameter", "max_completion_tokens")
+    if output_parameter not in ("max_completion_tokens", "max_tokens"):
+        raise ConfigError(
+            f"{prefix}.openai_output_limit_parameter 应为 max_completion_tokens 或 max_tokens"
+        )
+
     return ProviderConfig(
         name=name,
         protocol=protocol,  # type: ignore[arg-type]  # 上面已校验取值范围
@@ -102,6 +114,13 @@ def _parse_provider(item: object, index: int) -> ProviderConfig:
         model=model,
         base_url=base_url,
         thinking=thinking,
+        # 预算由 ContextLimits 在发送前校验；非法值不会阻止选择其它 provider。
+        context_window=cast(int | None, item.get("context_window")),
+        max_output_tokens=cast(int, item.get("max_output_tokens", 4096)),
+        compact_max_output_tokens=cast(int, item.get("compact_max_output_tokens", 20000)),
+        openai_output_limit_parameter=cast(
+            Literal["max_completion_tokens", "max_tokens"], output_parameter
+        ),
     )
 
 

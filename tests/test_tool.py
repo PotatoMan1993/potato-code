@@ -85,6 +85,12 @@ async def test_read_file_with_line_numbers(tmp_path):
     assert not r.is_error
     assert "     1\talpha" in r.content
     assert "     2\tbeta" in r.content
+    observation = r.file_observation
+    assert observation is not None
+    assert observation.operation == "read"
+    assert observation.delivered_text == r.content
+    assert observation.complete
+    assert (observation.start_line, observation.end_line) == (1, 2)
 
 
 async def test_read_file_missing_is_error(tmp_path):
@@ -92,6 +98,7 @@ async def test_read_file_missing_is_error(tmp_path):
     r = await ReadFileTool().execute(json.dumps({"path": str(tmp_path / "nope.txt")}))
     assert r.is_error
     assert "不存在" in r.content
+    assert r.file_observation is None
 
 
 async def test_read_file_directory_is_error(tmp_path):
@@ -110,6 +117,9 @@ async def test_write_file_creates_nested_dirs(tmp_path):
     r = await WriteFileTool().execute(json.dumps({"path": str(target), "content": "hello\n"}))
     assert not r.is_error
     assert target.read_text(encoding="utf-8") == "hello\n"
+    assert r.file_observation is not None
+    assert r.file_observation.operation == "write"
+    assert r.file_observation.delivered_text is None
 
 
 # ────────── edit_file ──────────
@@ -124,6 +134,8 @@ async def test_edit_file_unique_replace(tmp_path):
     )
     assert not r.is_error
     assert p.read_text(encoding="utf-8") == "a XY b"
+    assert r.file_observation is not None
+    assert r.file_observation.operation == "edit"
 
 
 async def test_edit_file_zero_match(tmp_path):
@@ -135,6 +147,26 @@ async def test_edit_file_zero_match(tmp_path):
     )
     assert r.is_error
     assert "未找到" in r.content
+    assert r.file_observation is None
+
+
+async def test_read_observation_records_partial_range_and_tool_truncation(tmp_path):
+    """局部读取和工具字符截断不会被误称为完整文件。"""
+    path = tmp_path / "SKILL.md"
+    path.write_text("first\nsecond\nthird", encoding="utf-8")
+    result = await ReadFileTool().execute(json.dumps({"path": str(path), "offset": 1, "limit": 1}))
+    observation = result.file_observation
+    assert observation is not None
+    assert not observation.complete and not observation.truncated
+    assert (observation.start_line, observation.end_line) == (2, 2)
+    path.write_text("x" * 300_000, encoding="utf-8")
+    result = await ReadFileTool().execute(json.dumps({"path": str(path)}))
+    observation = result.file_observation
+    assert observation is not None
+    assert observation.truncated and not observation.complete
+    assert observation.delivered_text is not None
+    assert len(observation.delivered_text) == 256 * 1024
+    assert result.content == observation.delivered_text + "\n[truncated]"
 
 
 async def test_edit_file_multi_match(tmp_path):

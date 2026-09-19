@@ -2,13 +2,62 @@
 
 from __future__ import annotations
 
-from potatocode.conversation import Conversation
+import pytest
+
+from potatocode.conversation import Conversation, ToolResultPatch, UserQuote, legal_boundaries
 from potatocode.llm import ToolCall, ToolResult
 
 
 def test_empty_at_start():
     """新会话历史为空。"""
     assert Conversation().messages() == []
+
+
+def test_snapshots_and_arguments_are_deeply_isolated():
+    conv = Conversation()
+    calls = [ToolCall("c", "read_file", "{}")]
+    conv.add_assistant_with_tool_calls("读取", calls)
+    calls[0].name = "被外部修改"
+    snapshot = conv.snapshot()
+    snapshot.entries[0].message.tool_calls[0].name = "再次修改"
+    assert conv.messages()[0].tool_calls[0].name == "read_file"
+
+
+def test_prefix_replacement_preserves_ids_quotes_and_recent_content():
+    conv = Conversation()
+    conv.add_user("用户原话")
+    conv.add_assistant("完成早期工作")
+    conv.add_user("最近要求")
+    before = conv.snapshot()
+    quotes = (UserQuote(before.entries[0].id, "用户原话"),)
+    conv.replace_prefix(before.revision, 2, "摘要", quotes)
+    after = conv.snapshot()
+    assert after.entries[1:] == before.entries[2:]
+    assert after.entries[0].origin == "summary" and after.entries[0].verified_quotes == quotes
+    assert after.content_epoch == before.content_epoch + 1
+    with pytest.raises(ValueError, match="会话已变化"):
+        conv.replace_prefix(before.revision, 1, "过时摘要")
+    assert conv.snapshot() == after
+
+
+def test_invalid_tool_patch_batch_is_atomic_and_split_cannot_break_pair():
+    conv = Conversation()
+    conv.add_user("读取")
+    conv.add_assistant_with_tool_calls("", [ToolCall("c", "read_file", "{}")])
+    conv.add_tool_results([ToolResult("c", "原文", True)])
+    conv.add_user("继续")
+    before = conv.snapshot()
+    assert legal_boundaries(before.entries) == {0, 1, 3, 4}
+    with pytest.raises(ValueError, match="拆散"):
+        conv.replace_prefix(before.revision, 2, "无效摘要")
+    with pytest.raises(ValueError, match="关联或错误"):
+        conv.replace_tool_results(
+            before.revision,
+            [
+                ToolResultPatch(before.entries[2].id, 0, ToolResult("c", "预览", False)),
+            ],
+        )
+    assert conv.snapshot() == before
 
 
 def test_multi_turn_order_and_roles():

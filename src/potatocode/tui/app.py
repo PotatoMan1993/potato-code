@@ -17,11 +17,12 @@ from textual.widgets import RichLog, Static, TextArea
 
 from ..agent import ApprovalRequest
 from ..config import ProviderConfig
+from ..context.manager import ContextManager
 from ..conversation import Conversation
 from ..llm import Provider, new_provider
+from ..mcp import Manager
 from ..permission import Mode, Outcome
 from ..permission.engine import Engine
-from ..mcp import Manager
 from ..prompt import EXECUTE_DIRECTIVE, render_banner
 from ..tool import Registry
 from .select import ProviderSelect
@@ -173,7 +174,7 @@ class PotatoCodeApp(StreamMixin, App):
         version: str,
         registry: Registry,
         engine: Engine,
-        manager: Manager,
+        manager: Manager | None = None,
     ) -> None:
         super().__init__()
         self.providers = providers
@@ -184,6 +185,9 @@ class PotatoCodeApp(StreamMixin, App):
         self.manager = manager  # mcp manager
         self.provider: Provider | None = None
         self.conv = Conversation()
+        self.context_manager = ContextManager(self.conv, engine)
+        self._compact_only = False
+        self.usage_incomplete = False
         self.state = SessionState.IDLE
         self.cur_reply = ""
         self.turn_start = 0.0
@@ -221,8 +225,10 @@ class PotatoCodeApp(StreamMixin, App):
         log = self.query_one("#log", RichLog)
         title = Text()
         title.append(render_banner(self._version, os.getcwd()), style="cyan")
-        title.append(f"\n  Connected to {len(self.manager._sessions)} MCP server(s)", style="dim")
-        title.append(f", {len(self.manager._tools)} tools registered", style="dim")
+        sessions = len(self.manager._sessions) if self.manager else 0
+        tools = len(self.manager._tools) if self.manager else 0
+        title.append(f"\n  Connected to {sessions} MCP server(s)", style="dim")
+        title.append(f", {tools} tools registered", style="dim")
         log.write(title)
         self._update_statusbar()
 
@@ -259,6 +265,7 @@ class PotatoCodeApp(StreamMixin, App):
                 model,
                 usage_in=self.usage_in,
                 usage_out=self.usage_out,
+                usage_incomplete=self.usage_incomplete,
             )
         )
 
@@ -287,6 +294,10 @@ class PotatoCodeApp(StreamMixin, App):
             # 流式期间 / 未选定 provider：不接受新提交（保留已输入内容）
             return
 
+        if text == "/compact":
+            input_box.clear()
+            self._start_turn(compact=True)
+            return
         if text == "/plan":
             # 进入计划模式：仅只读工具 + 计划态系统后缀（F10）
             input_box.clear()
@@ -301,7 +312,7 @@ class PotatoCodeApp(StreamMixin, App):
             input_box.clear()
             self.mode = Mode.DEFAULT
             self._update_statusbar()
-            self.conv.add_user(EXECUTE_DIRECTIVE)
+            self.conv.add_user(EXECUTE_DIRECTIVE, origin="control")
             self.query_one("#log", RichLog).write(user_block(EXECUTE_DIRECTIVE))
             self._start_turn()
             return
@@ -311,14 +322,15 @@ class PotatoCodeApp(StreamMixin, App):
         self.query_one("#log", RichLog).write(user_block(text))
         self._start_turn()
 
-    def _start_turn(self) -> None:
+    def _start_turn(self, compact: bool = False) -> None:
         """启动一轮 Agent Loop：建取消事件、起消费 task、进 STREAMING 态。"""
         self.cur_reply = ""
         self.cur_tools = []
         self.iter = 0
         self.turn_start = time.monotonic()
         self.turn_cancel = asyncio.Event()
-        self.state = SessionState.STREAMING
+        self._compact_only = compact
+        self.state = SessionState.COMPACTING if compact else SessionState.STREAMING
         self._refresh_streaming_view()
         self._stream_task = asyncio.create_task(self._consume_agent_events())
         self._timer = self.set_interval(0.1, self._tick)
@@ -329,7 +341,10 @@ class PotatoCodeApp(StreamMixin, App):
         """Ctrl+C：流式/待批准态取消本轮（不退出程序）；空闲态退出程序（F7/AC10）。"""
         if self.state is SessionState.APPROVING:
             self._cancel_approval()
-        elif self.state is SessionState.STREAMING and self.turn_cancel is not None:
+        elif (
+            self.state in (SessionState.STREAMING, SessionState.COMPACTING)
+            and self.turn_cancel is not None
+        ):
             self.turn_cancel.set()
         else:
             self.exit()
@@ -338,7 +353,10 @@ class PotatoCodeApp(StreamMixin, App):
         """Esc：流式/待批准态取消本轮；其余状态忽略（F7/AC10）。"""
         if self.state is SessionState.APPROVING:
             self._cancel_approval()
-        elif self.state is SessionState.STREAMING and self.turn_cancel is not None:
+        elif (
+            self.state in (SessionState.STREAMING, SessionState.COMPACTING)
+            and self.turn_cancel is not None
+        ):
             self.turn_cancel.set()
 
     def _cancel_approval(self) -> None:
@@ -363,4 +381,5 @@ class PotatoCodeApp(StreamMixin, App):
         """安全退出：先取消进行中的流式 task，再退出应用（还原终端）。"""
         if self._stream_task is not None and not self._stream_task.done():
             self._stream_task.cancel()
+            await asyncio.gather(self._stream_task, return_exceptions=True)
         self.exit()

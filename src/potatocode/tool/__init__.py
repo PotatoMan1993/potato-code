@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from ..llm import ToolDefinition
+from .file_observation import FileObservation
 
 # 单个工具执行的默认超时秒数（N1：超时不配置化，内置合理默认值）
 DEFAULT_TIMEOUT: float = 30.0
@@ -35,6 +36,7 @@ class Result:
 
     content: str
     is_error: bool = False
+    file_observation: FileObservation | None = None
 
 
 @runtime_checkable
