@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
@@ -64,51 +63,10 @@ class Message:
 class Usage:
     """协议无关地承载一轮请求的 token 用量（含缓存命中信息，F4）。"""
 
-    input_tokens: int | None = None  # 完整输入；缺失与真实零值分开
-    output_tokens: int | None = None  # API 输出，可能包含未保留的思考
+    input_tokens: int = 0  # 本轮请求输入（含完整历史）token 数
+    output_tokens: int = 0  # 本轮响应输出 token 数
     cache_write: int = 0  # Anthropic: cache_creation_input_tokens；OpenAI 恒 0
     cache_read: int = 0  # Anthropic: cache_read_input_tokens；OpenAI: cached_tokens
-    raw_counts: dict[str, int | None] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class ContextLimits:
-    """端点显式预算；保留非法配置到请求前报告，不猜测模型窗口。"""
-
-    context_window: int | None = None
-    max_output_tokens: int = 4096
-    compact_max_output_tokens: int = 20000
-
-    def validate(self) -> None:
-        if type(self.context_window) is not int or self.context_window <= 33000:
-            raise ValueError("请配置 context_window：必须是大于 33,000 的整数")
-        if type(self.max_output_tokens) is not int or not (
-            0 < self.max_output_tokens < self.context_window
-        ):
-            raise ValueError("max_output_tokens 必须是小于 context_window 的正整数")
-        if type(self.compact_max_output_tokens) is not int or not (
-            0 < self.compact_max_output_tokens <= 20000
-        ):
-            raise ValueError("compact_max_output_tokens 必须是至多 20,000 的正整数")
-
-
-@dataclass(frozen=True)
-class BudgetShape:
-    """真实协议输入的规范 JSON；消息分组与内部历史一一对应。"""
-
-    fixed: tuple[str, ...] = ()
-    messages: tuple[tuple[str, ...], ...] = ()
-    trailing: tuple[str, ...] = ()
-
-
-class StopReason(StrEnum):
-    """正常终止信号与输出完整性不能混为一谈。"""
-
-    STOP = "stop"
-    TOOL_CALLS = "tool_calls"
-    LENGTH = "length"
-    REFUSAL = "refusal"
-    UNKNOWN = "unknown"
 
 
 @dataclass
@@ -127,8 +85,6 @@ class Request:
     tools: list[ToolDefinition] = field(default_factory=list)  # 本轮工具集（普通=全量/规划=只读）
     system: System = field(default_factory=System)  # 稳定系统提示 + 环境段
     reminder: str = ""  # 本轮 system-reminder 内容（已含标签；空=不注入）
-    purpose: Literal["normal", "summary"] = "normal"
-    max_output_tokens: int = 4096
 
 
 @dataclass
@@ -145,8 +101,6 @@ class StreamEvent:
     usage: Usage | None = None  # 非空：本轮 token 用量，done 之前一次性发出
     done: bool = False  # 本轮正常结束
     err: Exception | None = None  # 出错时携带异常
-    stop_reason: StopReason | None = None
-    raw_stop_reason: str | None = None
 
 
 @runtime_checkable
@@ -166,17 +120,6 @@ class Provider(Protocol):
 
     @property
     def model(self) -> str: ...  # -> 状态栏右
-
-    @property
-    def identity(self) -> str: ...
-
-    @property
-    def protocol(self) -> str: ...
-
-    @property
-    def context_limits(self) -> ContextLimits: ...
-
-    def budget_shape(self, req: Request) -> BudgetShape: ...
 
     def stream(self, req: Request) -> AsyncIterator[StreamEvent]: ...
 
@@ -204,9 +147,6 @@ __all__ = [
     "ToolDefinition",
     "ToolResult",
     "Usage",
-    "ContextLimits",
-    "BudgetShape",
-    "StopReason",
     "ROLE_ASSISTANT",
     "ROLE_TOOL",
     "ROLE_USER",

@@ -12,33 +12,22 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator
-from contextlib import aclosing
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import cast
 
 from .. import prompt
-from ..context.manager import ContextManager
-from ..context.stream import cancellable_stream
-from ..context.types import (
-    CompactResult,
-    ContextEvent,
-    PreparedRequest,
-    RequestFrame,
-    RequestRecord,
-    RunScope,
-)
 from ..conversation import Conversation
 from ..llm import (
     ROLE_ASSISTANT,
     Provider,
-    StopReason,
+    Request,
     System,
     ToolCall,
+    ToolDefinition,
     ToolResult,
 )
 from ..llm import Usage as LlmUsage
-from ..llm.errors import ContextWindowExceeded
 from ..permission import Decision, Mode, Outcome
 from ..permission.engine import Engine
 from ..tool import DEFAULT_TIMEOUT, Registry
@@ -97,8 +86,8 @@ class ToolEvent:
 class Usage:
     """一轮请求的 token 用量（透传 llm.Usage 的语义，含缓存命中，F4）。"""
 
-    input: int | None = None
-    output: int | None = None
+    input: int = 0
+    output: int = 0
     cache_write: int = 0
     cache_read: int = 0
 
@@ -115,10 +104,6 @@ class Event:
     notice: str = ""  # 系统提示（停止原因等），仅用于 UI 展示，不入对话历史
     done: bool = False  # 本轮（整个 Loop）结束
     err: Exception | None = None  # 出错（不中断会话）
-    context: ContextEvent | None = None
-    context_done: bool = False
-    reset_reply: bool = False
-    usage_missing: bool = False
 
 
 @dataclass
@@ -177,12 +162,10 @@ class Agent:
         registry: Registry,
         engine: Engine,
         version: str = "",
-        context: ContextManager | None = None,
     ) -> None:
         self._provider = provider
         self._registry = registry
         self._version = version
-        self._context = context
         self.engine = engine  # 权限引擎：前四层判定，实际运行由 cli/tui 注入
 
     async def run(
@@ -192,8 +175,6 @@ class Agent:
         cancel: asyncio.Event,
     ) -> AsyncIterator[Event]:
         """执行 Agent Loop，以 async generator 吐出事件流。"""
-        self._context = self._context or ContextManager(conv, self.engine)
-        scope = RunScope()
         # 每次 run 起始采集环境、装配稳定系统提示（普通/规划一致；规划提醒已移出系统通道）
         env_text = prompt.gather_environment(self._version, self._provider.model).render()
         sys = prompt.build_system_prompt()
@@ -216,14 +197,8 @@ class Agent:
                 reminder = prompt.plan_reminder(full)
 
             # —— 请求本轮：转发文本增量，收集完整响应（含工具调用与用量）——
-            frame = RequestFrame(
-                System(stable=sys, environment=env_text),
-                tuple(defs),
-                reminder,
-                self._provider.context_limits.max_output_tokens,
-            )
             outcome = _StreamOutcome()
-            async for item in self._request_with_recovery(conv, frame, mode, cancel, scope):
+            async for item in self._stream_once(conv, defs, sys, env_text, reminder, cancel):
                 if isinstance(item, _StreamOutcome):
                     outcome = item
                 else:
@@ -239,6 +214,16 @@ class Agent:
                     if outcome.err is not None:
                         yield Event(err=outcome.err)
                 return
+
+            if outcome.usage is not None:
+                yield Event(
+                    usage=Usage(
+                        input=outcome.usage.input_tokens,
+                        output=outcome.usage.output_tokens,
+                        cache_write=outcome.usage.cache_write,
+                        cache_read=outcome.usage.cache_read,
+                    )
+                )
 
             if not outcome.calls:
                 # 自然完成：无工具调用的纯文本即最终答复（F2-1）
@@ -292,168 +277,56 @@ class Agent:
         _ensure_assistant_tail(conv, NOTICE_MAX_ITER)
         yield Event(done=True)
 
-    @staticmethod
-    def _usage_event(record: RequestRecord) -> Event:
-        if record.usage is None:
-            return Event(usage_missing=True)
-        return Event(
-            usage=Usage(
-                input=record.input_tokens,
-                output=record.output_tokens,
-                cache_write=record.usage.cache_write,
-                cache_read=record.usage.cache_read,
-            )
-        )
-
-    def _context_event(self, item: ContextEvent) -> Event:
-        if item.kind == "usage" and item.record is not None:
-            return self._usage_event(item.record)
-        return Event(context=item)
-
-    async def _request_with_recovery(
+    async def _stream_once(
         self,
         conv: Conversation,
-        frame: RequestFrame,
-        mode: Mode,
+        defs: list[ToolDefinition],
+        sys: str,
+        env_text: str,
+        reminder: str,
         cancel: asyncio.Event,
-        scope: RunScope,
     ) -> AsyncIterator[Event | _StreamOutcome]:
-        context = self._context
-        assert context is not None
-        prepared = None
-        async with aclosing(
-            context.preflight(self._provider, frame, mode, cancel, scope)
-        ) as events:
-            async for item in events:
-                if isinstance(item, PreparedRequest):
-                    prepared = item
-                else:
-                    yield self._context_event(item)
-        if prepared is None or prepared.request is None:
-            reason = prepared.blocked_reason if prepared else "请求未准备完成"
-            yield _StreamOutcome(ok=False, err=None if cancel.is_set() else ValueError(reason))
-            return
-        for attempt in (1, 2):
-            outcome = _StreamOutcome(ok=False)
-            async for streamed in self._stream_once(prepared, cancel, attempt):
-                if isinstance(streamed, _StreamOutcome):
-                    outcome = streamed
-                else:
-                    yield streamed
-            if outcome.ok or cancel.is_set() or not isinstance(outcome.err, ContextWindowExceeded):
-                yield outcome
-                return
-            if attempt == 2:
-                yield outcome
-                return
-            yield Event(reset_reply=True)
-            compacted = None
-            async with aclosing(
-                context.compact(self._provider, frame, mode, cancel, scope, "emergency")
-            ) as events:
-                async for event in events:
-                    if isinstance(event, CompactResult):
-                        compacted = event
-                    else:
-                        yield self._context_event(event)
-            if compacted is None or compacted.status != "success":
-                reason = compacted.reason if compacted else "紧急压缩未完成"
-                yield _StreamOutcome(ok=False, err=None if cancel.is_set() else ValueError(reason))
-                return
-            snapshot = conv.snapshot()
-            request = frame.request(snapshot)
-            estimate = context.estimator.estimate_request(
-                self._provider, request, snapshot, context.ledger
-            )
-            prepared = PreparedRequest(snapshot, request, estimate)
+        """发起一次请求：转发文本增量事件，累积完整文本与工具调用，记录本轮用量。
 
-    async def _stream_once(
-        self, prepared: PreparedRequest, cancel: asyncio.Event, attempt: int
-    ) -> AsyncIterator[Event | _StreamOutcome]:
-        """一次请求只结算一次；失败流不提交正文或调用，取消及时关闭网络流。"""
-        context = self._context
-        request = prepared.request
-        assert context is not None and request is not None
+        组装 `llm.Request`（稳定系统提示 + 环境段 + 本轮 reminder）发起请求；
+        最后 yield `_StreamOutcome`；ok=False 表示流出错或已取消
+        （出错时异常随 outcome.err 带回，由 run 收尾历史后再上抛）。
+        双路收集：文本增量实时推给事件流，完整响应（含拼齐 JSON 参数的工具调用）
+        供循环判断（F4）。
+        """
         if cancel.is_set():
             yield _StreamOutcome(ok=False)
             return
-        snapshot = prepared.snapshot
-        request_id = context.ledger.begin(
-            self._provider,
-            request,
-            snapshot,
-            0,
-            len(snapshot.entries),
-            attempt,
-            prepared.estimate,
-            context.estimator.estimate_fresh(self._provider, request),
-        )
+
         text_parts: list[str] = []
         calls: list[ToolCall] = []
-        usage = None
-        done = False
-        stop = None
-        outcome = _StreamOutcome(ok=False)
-        try:
-            async with aclosing(cancellable_stream(self._provider, request, cancel)) as events:
-                async for ev in events:
-                    if ev.usage is not None:
-                        context.ledger.observe(request_id, ev.usage)
-                        usage = ev.usage
-                    if ev.err is not None:
-                        raise ev.err
-                    if ev.stop_reason is not None:
-                        stop = ev.stop_reason
-                    if ev.tool_calls:
-                        calls.extend(ev.tool_calls)
-                    if ev.text:
-                        text_parts.append(ev.text)
-                        yield Event(text=ev.text)
-                    done = done or ev.done
-            if not done or stop in (StopReason.UNKNOWN, StopReason.REFUSAL):
-                raise ValueError("模型请求未正常结束")
-            if calls and stop == StopReason.LENGTH:
-                raise ValueError("工具调用输出被截断，未执行")
-            if stop == StopReason.LENGTH:
-                yield Event(notice="模型回复已达到输出上限。")
-            outcome = _StreamOutcome(text="".join(text_parts), calls=calls, usage=usage)
-        except asyncio.CancelledError:
-            cancel.set()
-        except Exception as error:
-            outcome.err = error
-        finally:
-            status = "cancelled" if cancel.is_set() else ("success" if outcome.ok else "failed")
-            from ..context.types import RequestStatus
-
-            record = context.ledger.finish(request_id, cast(RequestStatus, status), stop)
-            text_parts.clear()
-        yield self._usage_event(record)
-        yield outcome
-
-    async def compact(
-        self, conv: Conversation, mode: Mode, cancel: asyncio.Event
-    ) -> AsyncIterator[Event]:
-        """手动压缩不新增对话消息，也不推进普通 Agent 循环。"""
-        self._context = self._context or ContextManager(conv, self.engine)
-        env = prompt.gather_environment(self._version, self._provider.model).render()
-        defs = (
-            self._registry.read_only_definitions()
-            if mode == Mode.PLAN
-            else self._registry.definitions()
+        usage: LlmUsage | None = None
+        req = Request(
+            messages=conv.messages(),
+            tools=defs,
+            system=System(stable=sys, environment=env_text),
+            reminder=reminder,
         )
-        frame = RequestFrame(
-            System(stable=prompt.build_system_prompt(), environment=env),
-            tuple(defs),
-            prompt.plan_reminder(True) if mode == Mode.PLAN else "",
-            self._provider.context_limits.max_output_tokens,
-        )
-        async with aclosing(
-            self._context.compact(self._provider, frame, mode, cancel, RunScope(), "manual")
-        ) as events:
-            async for item in events:
-                if isinstance(item, ContextEvent):
-                    yield self._context_event(item)
-        yield Event(context_done=True)
+        async for ev in self._provider.stream(req):
+            if cancel.is_set():
+                yield _StreamOutcome(ok=False)
+                return
+            if ev.err is not None:
+                # 异常随 outcome 带回，由 run 收尾历史后再作为终止事件上抛
+                yield _StreamOutcome(ok=False, err=ev.err)
+                return
+            if ev.usage is not None:
+                usage = ev.usage
+            if ev.tool_calls:
+                calls.extend(ev.tool_calls)
+            if ev.text:
+                text_parts.append(ev.text)
+                yield Event(text=ev.text)
+
+        if cancel.is_set():
+            yield _StreamOutcome(ok=False)
+            return
+        yield _StreamOutcome(text="".join(text_parts), calls=calls, usage=usage, ok=True)
 
     async def _execute_batched(
         self,
@@ -639,8 +512,6 @@ class Agent:
     async def _run_tool(self, call: ToolCall) -> ToolResult:
         """执行单个工具调用：受 per-tool 超时约束，恒返回结构化结果（N1）。"""
         r = await self._registry.execute(call.name, call.input, timeout=DEFAULT_TIMEOUT)
-        if not r.is_error and r.file_observation is not None and self._context is not None:
-            self._context.attachments.observe_file(call.id, r.file_observation)
         return ToolResult(tool_call_id=call.id, content=r.content, is_error=r.is_error)
 
     def _all_unknown(self, calls: list[ToolCall]) -> bool:

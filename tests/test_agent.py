@@ -13,7 +13,6 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-from context_helpers import ContextProvider
 from potatocode.agent import (
     MAX_ITERATIONS,
     MAX_UNKNOWN_RUN,
@@ -45,7 +44,7 @@ def _make_agent(provider, registry: Registry, root: str | None = None) -> Agent:
     return Agent(provider, registry, _engine(root))
 
 
-class FakeProvider(ContextProvider):
+class FakeProvider:
     """fake provider：按请求次数逐轮返回脚本事件，并记录请求供断言。
 
     `scripts` 每轮一个事件列表；`repeat` 在脚本耗尽后每轮恒返该脚本。
@@ -58,11 +57,6 @@ class FakeProvider(ContextProvider):
         scripts: list[list[StreamEvent]] | None = None,
         repeat: list[StreamEvent] | None = None,
     ) -> None:
-        self.identity = "agent-test"
-        self.protocol = "openai"
-        from potatocode.llm import ContextLimits
-
-        self.context_limits = ContextLimits(1000000)
         self._scripts = scripts or []
         self._repeat = repeat
         self.calls = 0

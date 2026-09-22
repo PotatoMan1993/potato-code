@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 from . import Result, _parse_args
-from .file_observation import FileObservation, text_version
 
 
 class EditFileTool:
@@ -76,9 +75,4 @@ class EditFileTool:
             p.write_text(new_content, encoding="utf-8")
         except OSError as e:
             return Result(content=f"写入文件失败: {path}: {e}", is_error=True)
-        return Result(
-            content=f"已修改 {path}（1 处替换）",
-            file_observation=FileObservation(
-                path=str(p.resolve()), operation="edit", source_version=text_version(new_content)
-            ),
-        )
+        return Result(content=f"已修改 {path}（1 处替换）")

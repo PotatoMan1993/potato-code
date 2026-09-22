@@ -22,7 +22,6 @@ class SessionState(Enum):
     SELECTING = "selecting"  # 多 provider 时的选择界面
     IDLE = "idle"  # 等待用户输入
     STREAMING = "streaming"  # 等待/接收模型流（loading + 计时）
-    COMPACTING = "compacting"  # 摘要请求进行中，可取消
     APPROVING = "approving"  # 等待用户在人在回路菜单上做选择（F8）
 
 
@@ -46,7 +45,6 @@ def statusbar_content(
     model: str | None,
     usage_in: int = 0,
     usage_out: int = 0,
-    usage_incomplete: bool = False,
 ) -> RenderableType:
     """底部状态栏：左侧常驻显示当前权限模式（取代 provider 名）、右侧模型名 + 累计用量。"""
     label, style = {
@@ -65,8 +63,6 @@ def statusbar_content(
         right.append(
             f"{model} ● ↑{_fmt_tokens(usage_in)} ↓{_fmt_tokens(usage_out)} tokens", style="dim"
         )
-        if usage_incomplete:
-            right.append("（部分用量未知）", style="dim")
     else:
         right.append("请选择 provider", style="red")
 

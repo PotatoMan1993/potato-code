@@ -12,26 +12,13 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import uuid
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
 
 import openai
 from openai.types.chat import ChatCompletion, ChatCompletionMessageParam
 
-from . import (
-    BudgetShape,
-    ContextLimits,
-    Message,
-    Request,
-    StopReason,
-    StreamEvent,
-    ToolCall,
-    ToolDefinition,
-)
-from .errors import classify_error
-from .usage import canonical_json, merge_counts, usage_from_counts
+from . import Message, Request, StreamEvent, ToolCall, ToolDefinition, Usage
 
 if TYPE_CHECKING:
     from ..config import ProviderConfig
@@ -104,11 +91,6 @@ class OpenAIProvider:
     def __init__(self, cfg: ProviderConfig) -> None:
         self._name = cfg.name
         self._model = cfg.model
-        self._identity = uuid.uuid4().hex
-        self._limits = ContextLimits(
-            cfg.context_window, cfg.max_output_tokens, cfg.compact_max_output_tokens
-        )
-        self._output_parameter = cfg.openai_output_limit_parameter
         # base_url 非空时覆盖默认端点（接入兼容服务）
         self._client = openai.AsyncOpenAI(
             api_key=cfg.api_key,
@@ -123,78 +105,49 @@ class OpenAIProvider:
     def model(self) -> str:
         return self._model
 
-    @property
-    def identity(self) -> str:
-        return self._identity
-
-    @property
-    def protocol(self) -> str:
-        return "openai"
-
-    @property
-    def context_limits(self) -> ContextLimits:
-        return self._limits
-
-    def _input_params(self, req: Request) -> dict[str, Any]:
-        params: dict[str, Any] = {"messages": _to_openai_messages(req)}
-        if req.tools:
-            params["tools"] = _to_openai_tools(req.tools)
-        return params
-
-    def budget_shape(self, req: Request) -> BudgetShape:
-        params = self._input_params(req)
-        messages = params.pop("messages")
-        fixed = [canonical_json(messages[0])]
-        if params:
-            fixed.append(canonical_json(params))
-        groups: list[tuple[str, ...]] = []
-        position = 1
-        for message in req.messages:
-            size = len(message.tool_results) if message.role == "tool" else 1
-            groups.append(tuple(canonical_json(m) for m in messages[position : position + size]))
-            position += size
-        return BudgetShape(
-            fixed=tuple(fixed),
-            messages=tuple(groups),
-            trailing=tuple(canonical_json(m) for m in messages[position:]),
-        )
-
     async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
         """发起一轮流式对话，以 async generator 吐出 StreamEvent。"""
-        stream = None
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "messages": _to_openai_messages(req),
+            "stream": True,
+            # 开启后流末尾会出现带 usage 的 chunk，供本轮用量上抛（F8）
+            "stream_options": {"include_usage": True},
+        }
+        if req.tools:
+            kwargs["tools"] = _to_openai_tools(req.tools)
+
         try:
-            self._limits.validate()
-            if type(req.max_output_tokens) is not int or not (
-                0 < req.max_output_tokens < self._limits.context_window  # type: ignore[operator]
-            ):
-                raise ValueError("请求 max_output_tokens 必须是小于 context_window 的正整数")
-            if req.purpose == "summary" and req.max_output_tokens > 20000:
-                raise ValueError("摘要输出上限不能超过 20,000")
-            kwargs = self._input_params(req)
-            kwargs.update(model=self._model, stream=True, stream_options={"include_usage": True})
-            kwargs[self._output_parameter] = req.max_output_tokens
-            client = (
-                self._client.with_options(max_retries=0)
-                if req.purpose == "summary"
-                else self._client
-            )
-            stream = await client.chat.completions.create(**kwargs)
+            stream = await self._client.chat.completions.create(**kwargs)
             # stream=True 时 SDK 返回 AsyncStream[ChatCompletionChunk]（收窄联合类型）
             assert not isinstance(stream, ChatCompletion)
 
             # 按 index 累加 tool_calls 分片（多工具下同时分片，须拼齐参数）
             tool_calls_buf: dict[int, dict[str, str]] = {}
-            counts: dict[str, int | None] = {}
-            raw_reason: str | None = None
             async for chunk in stream:
-                if chunk.usage is not None:
-                    merge_counts(counts, chunk.usage)
-                    yield StreamEvent(usage=usage_from_counts(counts, self.protocol))
+                # 个别 chunk（如仅含 usage）可能没有 choices
                 if not chunk.choices:
+                    if chunk.usage:
+                        # 流末尾的用量 chunk：一次性上抛本轮 token 用量（F8）
+                        # cached_tokens 缺失即零值（N6）；OpenAI 前缀缓存无写计数，cache_write 恒 0
+                        cache_read = (
+                            getattr(
+                                getattr(chunk.usage, "prompt_tokens_details", None),
+                                "cached_tokens",
+                                0,
+                            )
+                            or 0
+                        )
+                        yield StreamEvent(
+                            usage=Usage(
+                                input_tokens=chunk.usage.prompt_tokens or 0,
+                                output_tokens=chunk.usage.completion_tokens or 0,
+                                cache_read=cache_read,
+                                cache_write=0,
+                            )
+                        )
                     continue
                 choice = chunk.choices[0]
-                if choice.finish_reason is not None:
-                    raw_reason = choice.finish_reason
                 delta = choice.delta
                 if delta.content:
                     yield StreamEvent(text=delta.content)
@@ -210,15 +163,7 @@ class OpenAIProvider:
                         if tc.function and tc.function.arguments:
                             buf["args"] = buf.get("args", "") + tc.function.arguments
 
-            if raw_reason is None:
-                raise RuntimeError("模型流提前结束，未收到正常终止信号")
-            reason = {
-                "stop": StopReason.STOP,
-                "tool_calls": StopReason.TOOL_CALLS,
-                "length": StopReason.LENGTH,
-                "content_filter": StopReason.REFUSAL,
-            }.get(raw_reason, StopReason.UNKNOWN)
-            if tool_calls_buf and reason in (StopReason.STOP, StopReason.TOOL_CALLS):
+            if tool_calls_buf:
                 # 空 arguments（无参工具）归一为 "{}"，避免回灌时报参数非法
                 calls = [
                     ToolCall(
@@ -228,15 +173,9 @@ class OpenAIProvider:
                     )
                     for _, v in sorted(tool_calls_buf.items())
                 ]
-                for call in calls:
-                    if not call.id or not call.name or not isinstance(json.loads(call.input), dict):
-                        raise ValueError("模型返回不完整的工具调用")
                 yield StreamEvent(tool_calls=calls)
-            yield StreamEvent(done=True, stop_reason=reason, raw_stop_reason=raw_reason)
+            yield StreamEvent(done=True)
         except asyncio.CancelledError:
             raise  # 调用方 cancel 时正常终止
         except Exception as e:  # 鉴权失败 / 限流 / 网络中断 / 模型不存在等
-            yield StreamEvent(err=classify_error(e, self.protocol))
-        finally:
-            if stream is not None and not isinstance(stream, ChatCompletion):
-                await stream.close()
+            yield StreamEvent(err=e)

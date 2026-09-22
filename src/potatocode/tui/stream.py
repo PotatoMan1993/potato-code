@@ -31,7 +31,6 @@ from .view import (
 )
 
 if TYPE_CHECKING:
-    from ..context.manager import ContextManager
     from ..conversation import Conversation
     from ..llm import Provider
     from ..tool import Registry
@@ -53,9 +52,6 @@ class StreamMixin:
     iter: int
     usage_in: int
     usage_out: int
-    usage_incomplete: bool
-    context_manager: ContextManager
-    _compact_only: bool
     cur_tools: list[ToolDisplay]
     turn_cancel: asyncio.Event | None
     engine: Engine
@@ -77,32 +73,9 @@ class StreamMixin:
         """
         assert self.provider is not None
         assert self.turn_cancel is not None
-        agent = Agent(
-            self.provider,
-            self._tool_registry,
-            self.engine,
-            self._version,
-            context=self.context_manager,
-        )
-        operation = agent.compact if self._compact_only else agent.run
+        agent = Agent(self.provider, self._tool_registry, self.engine, self._version)
         try:
-            async for ev in operation(self.conv, self.mode, self.turn_cancel):
-                if ev.context is not None:
-                    if ev.context.kind in ("start", "retry"):
-                        self.state = SessionState.COMPACTING
-                    elif not self._compact_only:
-                        self.state = SessionState.STREAMING
-                    if ev.context.message:
-                        self.query_one("#log", RichLog).write(notice_block(ev.context.message))  # type: ignore[attr-defined]
-                    self._refresh_streaming_view()
-                if ev.reset_reply:
-                    self.cur_reply = ""
-                    self._refresh_streaming_view()
-                if ev.context_done:
-                    self._stop_turn()
-                    self.state = SessionState.IDLE
-                    self._refocus_input()
-                    return
+            async for ev in agent.run(self.conv, self.mode, self.turn_cancel):
                 if ev.approval is not None:
                     # 人在回路（F8）：切 APPROVING、暂停读事件，等用户决策
                     self.pending = ev.approval
@@ -123,12 +96,8 @@ class StreamMixin:
                     self._handle_tool_event(ev.tool)
                 if ev.usage is not None:
                     # 会话累计计费用量（每轮 input+output 各自累加，F8/AC11）
-                    self.usage_in += ev.usage.input or 0
-                    self.usage_out += ev.usage.output or 0
-                    self.usage_incomplete |= ev.usage.input is None or ev.usage.output is None
-                    self._update_statusbar()
-                if ev.usage_missing:
-                    self.usage_incomplete = True
+                    self.usage_in += ev.usage.input
+                    self.usage_out += ev.usage.output
                     self._update_statusbar()
                 if ev.notice:
                     self.query_one("#log", RichLog).write(notice_block(ev.notice))  # type: ignore[attr-defined]
@@ -174,7 +143,7 @@ class StreamMixin:
 
     def _tick(self) -> None:
         """定时器回调：流式期间每 0.1s 刷新动画与秒数。"""
-        if self.state in (SessionState.STREAMING, SessionState.COMPACTING):
+        if self.state is SessionState.STREAMING:
             self._refresh_streaming_view()
 
     def _refresh_streaming_view(self) -> None:
@@ -185,15 +154,13 @@ class StreamMixin:
                 widget.update(approval_block(self.pending, self.approve_cursor))
                 widget.display = True
             return
-        if self.state not in (SessionState.STREAMING, SessionState.COMPACTING):
+        if self.state is not SessionState.STREAMING:
             widget.display = False
             return
         elapsed = time.monotonic() - self.turn_start
         spinner = _SPINNER[int(elapsed * 10) % len(_SPINNER)]
         waiting: RenderableType
-        if self.state is SessionState.COMPACTING:
-            waiting = Text(f"{spinner} 正在压缩上下文… ({int(elapsed)}s)", style="dim italic")
-        elif self.cur_tools:
+        if self.cur_tools:
             # 并发批可同时有多个工具在跑：逐行渲染（N2 执行指示）
             waiting = Group(
                 *(

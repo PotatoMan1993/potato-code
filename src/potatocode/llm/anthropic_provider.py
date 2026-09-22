@@ -13,24 +13,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import uuid
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
 
 import anthropic
 
-from . import (
-    BudgetShape,
-    ContextLimits,
-    Message,
-    Request,
-    StopReason,
-    StreamEvent,
-    ToolCall,
-    ToolDefinition,
-)
-from .errors import classify_error
-from .usage import canonical_json, merge_counts, usage_from_counts
+from . import Message, Request, StreamEvent, ToolCall, ToolDefinition, Usage
 
 if TYPE_CHECKING:
     from ..config import ProviderConfig
@@ -133,10 +121,6 @@ class AnthropicProvider:
         self._name = cfg.name
         self._model = cfg.model
         self._thinking = cfg.thinking
-        self._identity = uuid.uuid4().hex
-        self._limits = ContextLimits(
-            cfg.context_window, cfg.max_output_tokens, cfg.compact_max_output_tokens
-        )
         # base_url 非空时覆盖默认端点（接入兼容服务）
         self._client = anthropic.AsyncAnthropic(
             api_key=cfg.api_key,
@@ -151,88 +135,42 @@ class AnthropicProvider:
     def model(self) -> str:
         return self._model
 
-    @property
-    def identity(self) -> str:
-        return self._identity
-
-    @property
-    def protocol(self) -> str:
-        return "anthropic"
-
-    @property
-    def context_limits(self) -> ContextLimits:
-        return self._limits
-
-    def _input_params(self, req: Request) -> dict[str, Any]:
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+        """发起一轮流式对话，以 async generator 吐出 StreamEvent。"""
         params: dict[str, Any] = {
+            "model": self._model,
+            "max_tokens": 4096,
             "system": _build_system_blocks(req.system.stable, req.system.environment),
             "messages": _to_anthropic_messages(req.messages),
         }
-        _append_reminder_anthropic(params["messages"], req.reminder)
+        if req.reminder:
+            # 织入补充指令：并入末条 user 消息的 content 块，不污染缓存、不破坏角色交替
+            _append_reminder_anthropic(params["messages"], req.reminder)
         if req.tools:
             params["tools"] = _to_anthropic_tools(req.tools)
-        return params
+        if self._thinking and not _has_tool_history(req.messages):
+            # 扩展思考：budget_tokens 必须小于 max_tokens；含工具历史的请求关闭以避免 400
+            params["thinking"] = {"type": "enabled", "budget_tokens": 2048}
 
-    def budget_shape(self, req: Request) -> BudgetShape:
-        params = self._input_params(req)
-        messages = params.pop("messages")
-        boundary = len(req.messages)
-        return BudgetShape(
-            fixed=(canonical_json(params),),
-            messages=tuple((canonical_json(m),) for m in messages[:boundary]),
-            trailing=tuple(canonical_json(m) for m in messages[boundary:]),
-        )
-
-    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
-        """发起一轮流式对话，以 async generator 吐出 StreamEvent。"""
         try:
-            self._limits.validate()
-            if type(req.max_output_tokens) is not int or not (
-                0 < req.max_output_tokens < self._limits.context_window  # type: ignore[operator]
-            ):
-                raise ValueError("请求 max_output_tokens 必须是小于 context_window 的正整数")
-            if req.purpose == "summary" and req.max_output_tokens > 20000:
-                raise ValueError("摘要输出上限不能超过 20,000")
-            params = self._input_params(req)
-            params.update(model=self._model, max_tokens=req.max_output_tokens)
-            if self._thinking and req.purpose == "normal" and not _has_tool_history(req.messages):
-                if req.max_output_tokens <= 2048:
-                    raise ValueError("启用 thinking 时 max_output_tokens 必须大于 2,048")
-                params["thinking"] = {"type": "enabled", "budget_tokens": 2048}
-            client = (
-                self._client.with_options(max_retries=0)
-                if req.purpose == "summary"
-                else self._client
-            )
-            counts: dict[str, int | None] = {}
-            stopped = False
-            async with client.messages.stream(**params) as stream:
+            async with self._client.messages.stream(**params) as stream:
                 async for event in stream:
+                    # 只取正文文本增量；thinking_delta/input_json_delta 等一律丢弃
                     if event.type == "content_block_delta" and event.delta.type == "text_delta":
                         yield StreamEvent(text=event.delta.text)
-                    elif event.type == "message_start":
-                        merge_counts(counts, event.message.usage)
-                        yield StreamEvent(usage=usage_from_counts(counts, self.protocol))
-                    elif event.type == "message_delta":
-                        merge_counts(counts, event.usage)
-                        yield StreamEvent(usage=usage_from_counts(counts, self.protocol))
-                    elif event.type == "message_stop":
-                        stopped = True
-                if not stopped:
-                    raise RuntimeError("模型流提前结束，未收到正常终止信号")
-                final_message = await stream.get_final_message()
-            merge_counts(counts, final_message.usage)
-            yield StreamEvent(usage=usage_from_counts(counts, self.protocol))
-            raw_reason = final_message.stop_reason
-            reason = {
-                "end_turn": StopReason.STOP,
-                "stop_sequence": StopReason.STOP,
-                "tool_use": StopReason.TOOL_CALLS,
-                "max_tokens": StopReason.LENGTH,
-                "model_context_window_exceeded": StopReason.LENGTH,
-                "refusal": StopReason.REFUSAL,
-            }.get(str(raw_reason), StopReason.UNKNOWN)
-            if reason == StopReason.TOOL_CALLS:
+            final_message = await stream.get_final_message()
+            # 流正常结束后一次性上抛本轮 token 用量（F8），先于 done 事件
+            # 缓存字段缺失即零值，不额外校验、不抛异常（N6）
+            yield StreamEvent(
+                usage=Usage(
+                    input_tokens=final_message.usage.input_tokens,
+                    output_tokens=final_message.usage.output_tokens,
+                    cache_write=getattr(final_message.usage, "cache_creation_input_tokens", 0) or 0,
+                    cache_read=getattr(final_message.usage, "cache_read_input_tokens", 0) or 0,
+                )
+            )
+            if final_message.stop_reason == "tool_use":
+                # 用 SDK 汇总的完整消息收集 tool_use 块（SDK 已累加 input JSON）
                 calls = [
                     ToolCall(
                         id=block.id,
@@ -244,8 +182,8 @@ class AnthropicProvider:
                 ]
                 if calls:
                     yield StreamEvent(tool_calls=calls)
-            yield StreamEvent(done=True, stop_reason=reason, raw_stop_reason=raw_reason)
+            yield StreamEvent(done=True)
         except asyncio.CancelledError:
             raise  # 调用方 cancel 时正常终止，SDK 流由 async with 清理
         except Exception as e:  # 鉴权失败 / 限流 / 网络中断 / 模型不存在等
-            yield StreamEvent(err=classify_error(e, self.protocol))
+            yield StreamEvent(err=e)
