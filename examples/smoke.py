@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 from potatocode import config
-from potatocode.agent import Agent, Phase
+from potatocode.agent import Agent, Phase, new_runtime
 from potatocode.conversation import Conversation
 from potatocode.llm import new_provider
 from potatocode.permission import Mode, new_engine
@@ -56,7 +56,9 @@ async def main() -> None:
     registry = new_default_registry()
     # 非交互：以 BYPASS 运行（黑名单/沙箱仍在），避免阻塞在人在回路 Ask
     engine, _ = new_engine(str(Path.cwd().resolve()))
-    agent = Agent(provider, registry, engine, version="dev")
+    # smoke 场景固定上下文窗口，避免依赖 provider 配置
+    runtime = new_runtime(workspace=str(Path.cwd().resolve()), context_window=200000)
+    agent = Agent(provider, registry, engine, version="dev", runtime=runtime)
     conv = Conversation()
 
     messages = sys.argv[1:] or ["你好，请用一句话介绍你自己。"]

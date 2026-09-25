@@ -12,5 +12,8 @@ __pycache__/
 # PotatoCode 运行配置（含真实密钥，N5）
 .potatocode/*.yaml
 
+# 会话落盘目录（工具结果预览体原文，调试副产物）
+.potatocode/sessions/
+
 # api_keys存储文档
 api_keys.txt

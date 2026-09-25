@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
-from potatocode.config import ConfigError, load
+from potatocode.config import ConfigError, ProviderConfig, effective_context_window, load
 
 # 合法配置样例（两条 provider，覆盖各字段）
 VALID_YAML = """
@@ -129,3 +131,74 @@ providers:
 """
     with pytest.raises(ConfigError, match=r"providers\[1\]\.api_key 不能为空"):
         load(write_config(tmp_path, yaml_text))
+
+
+# ────────── context_window 与协议默认值 ──────────
+
+CONTEXT_YAML = """
+providers:
+  - name: X
+    protocol: anthropic
+    api_key: k
+    model: m
+    context_window: 80000
+"""
+
+
+def test_effective_context_window_unconfigured():
+    """anthropic 未配置 → 200000。"""
+    p = ProviderConfig(name="x", protocol="anthropic", api_key="k", model="m")
+    assert p.context_window == 0
+    assert effective_context_window(p) == 200000
+
+
+def test_effective_context_window_zero():
+    """openai 显式配置 0 → 视为未配置，取 128000。"""
+    p = ProviderConfig(name="x", protocol="openai", api_key="k", model="m", context_window=0)
+    assert effective_context_window(p) == 128000
+
+
+def test_effective_context_window_positive():
+    """配置为正数时优先于协议默认值。"""
+    p = ProviderConfig(name="x", protocol="anthropic", api_key="k", model="m", context_window=80000)
+    assert effective_context_window(p) == 80000
+
+
+def test_effective_context_window_unknown_protocol():
+    """未知协议按保守默认 200000（协议字段已校验，此处用构造绕过）。"""
+    p = ProviderConfig.__new__(ProviderConfig)
+    p.context_window = 0
+    p.protocol = "gemini"  # type: ignore[assignment]
+    assert effective_context_window(p) == 200000
+
+
+def test_load_context_window_from_yaml(tmp_path):
+    """YAML 中的 context_window 被正确解码。"""
+    cfg = load(write_config(tmp_path, CONTEXT_YAML))
+    assert cfg.providers[0].context_window == 80000
+    assert effective_context_window(cfg.providers[0]) == 80000
+
+
+def test_load_invalid_context_window(tmp_path):
+    """context_window 非整数 / 负数时报可读错误。"""
+    with pytest.raises(ConfigError, match=r"providers\[0\]\.context_window 应为整数"):
+        load(write_config(tmp_path, CONTEXT_YAML.replace("80000", '"80000"')))
+
+    with pytest.raises(ConfigError, match=r"providers\[0\]\.context_window 不能为负数"):
+        load(write_config(tmp_path, CONTEXT_YAML.replace("80000", "-1")))
+
+
+def test_example_config_is_parseable():
+    """配置示例文件可被解析，且展示的 context_window 字段生效。"""
+    import yaml
+
+    from potatocode.config.config import Config, _from_dict
+
+    example = Path(".potatocode/config.yaml.example")
+    raw = yaml.safe_load(example.read_text(encoding="utf-8"))
+    cfg = _from_dict(raw, str(example))
+
+    assert isinstance(cfg, Config)
+    first = cfg.providers[0]
+    assert first.context_window == 200000
+    assert effective_context_window(first) == 200000

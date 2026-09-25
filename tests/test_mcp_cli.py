@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from potatocode import cli
+from potatocode.agent import new_runtime
 from potatocode.config import ProviderConfig
 from potatocode.permission import new_engine
 from potatocode.tool import new_default_registry
@@ -53,9 +54,10 @@ async def test_amain_registers_mcp_tools_and_closes_manager(monkeypatch):
         return manager
 
     class FakeApp:
-        def __init__(self, providers, version, registry, engine):
+        def __init__(self, providers, version, registry, engine, manager=None, runtime=None):
             observed["providers"] = providers
             observed["definitions"] = registry.definitions()
+            observed["runtime"] = runtime
 
         async def run_async(self):
             observed["ran"] = True
@@ -82,7 +84,7 @@ async def test_amain_closes_manager_when_tui_fails(monkeypatch):
     manager = FakeManager()
 
     class BrokenApp:
-        def __init__(self, *args):
+        def __init__(self, *args, **kwargs):
             pass
 
         async def run_async(self):
@@ -115,7 +117,9 @@ async def test_textual_headless_starts_with_mcp_tool(tmp_path):
         api_key="test-key",
         model="test-model",
     )
-    app = PotatoCodeApp([provider], "test", registry, engine)
+    app = PotatoCodeApp(
+        [provider], "test", registry, engine, runtime=new_runtime(workspace=str(tmp_path))
+    )
 
     async with app.run_test():
         names = [definition.name for definition in app._tool_registry.definitions()]

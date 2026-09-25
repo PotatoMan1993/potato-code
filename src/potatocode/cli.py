@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from . import __version__, config, mcp, permission
+from .agent import new_runtime
 from .config import ConfigError
 from .tool import new_default_registry
 from .tui import PotatoCodeApp
@@ -37,7 +38,11 @@ async def _amain() -> int:
         engine, err = permission.new_engine(root)
         if err is not None:
             print(f"权限引擎降级: {err}", file=sys.stderr)
-        await PotatoCodeApp(cfg.providers, __version__, registry, engine, manager).run_async()
+        # 会话级运行时：会话目录 + 压缩账本，注入 TUI 后跨轮复用
+        runtime = new_runtime(workspace=root)
+        await PotatoCodeApp(
+            cfg.providers, __version__, registry, engine, manager, runtime=runtime
+        ).run_async()
     except KeyboardInterrupt:
         pass  # 终端层的 Ctrl+C，安静退出
     finally:

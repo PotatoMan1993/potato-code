@@ -15,15 +15,17 @@ from textual.message import Message
 from textual.timer import Timer
 from textual.widgets import RichLog, Static, TextArea
 
-from ..agent import ApprovalRequest
-from ..config import ProviderConfig
+from ..agent import Agent, ApprovalRequest
+from ..agent.runtime import SessionRuntime, new_runtime
+from ..config import ProviderConfig, effective_context_window
 from ..conversation import Conversation
-from ..llm import Provider, new_provider
+from ..llm import Provider, ToolDefinition, new_provider
+from ..mcp import Manager
 from ..permission import Mode, Outcome
 from ..permission.engine import Engine
-from ..mcp import Manager
-from ..prompt import EXECUTE_DIRECTIVE, render_banner
+from ..prompt import render_banner
 from ..tool import Registry
+from .commands import dispatch_command
 from .select import ProviderSelect
 from .stream import StreamMixin
 from .view import SessionState, ToolDisplay, notice_block, statusbar_content, user_block
@@ -173,7 +175,8 @@ class PotatoCodeApp(StreamMixin, App):
         version: str,
         registry: Registry,
         engine: Engine,
-        manager: Manager,
+        manager: Manager | None = None,
+        runtime: SessionRuntime | None = None,
     ) -> None:
         super().__init__()
         self.providers = providers
@@ -183,6 +186,10 @@ class PotatoCodeApp(StreamMixin, App):
         self.engine = engine  # 权限引擎（前四层），模式切换只影响后续兜底裁决
         self.manager = manager  # mcp manager
         self.provider: Provider | None = None
+        # 跨轮持有的长生命周期状态：压缩账本、文件追踪、熔断计数、用量锚点
+        self.runtime = runtime if runtime is not None else new_runtime()
+        self.agent: Agent | None = None  # 常驻 Agent，选定 provider 后构造一次
+        self.compact_task: asyncio.Task | None = None  # 后台手动压缩任务
         self.conv = Conversation()
         self.state = SessionState.IDLE
         self.cur_reply = ""
@@ -221,8 +228,11 @@ class PotatoCodeApp(StreamMixin, App):
         log = self.query_one("#log", RichLog)
         title = Text()
         title.append(render_banner(self._version, os.getcwd()), style="cyan")
-        title.append(f"\n  Connected to {len(self.manager._sessions)} MCP server(s)", style="dim")
-        title.append(f", {len(self.manager._tools)} tools registered", style="dim")
+        if self.manager is not None:  # 未注入 manager 的场景（单测）不展示 MCP 统计
+            title.append(
+                f"\n  Connected to {len(self.manager._sessions)} MCP server(s)", style="dim"
+            )
+            title.append(f", {len(self.manager._tools)} tools registered", style="dim")
         log.write(title)
         self._update_statusbar()
 
@@ -241,13 +251,40 @@ class PotatoCodeApp(StreamMixin, App):
         self.query_one(ProviderSelect).focus()
 
     def _activate_provider(self, cfg: ProviderConfig) -> None:
-        """选定 provider：构造适配器、更新状态栏、切回对话界面。"""
+        """选定 provider：构造适配器、注入上下文窗口、更新状态栏、切回对话界面。"""
         self.provider = new_provider(cfg)
+        self.agent = None  # 换 provider 后重建 Agent（上下文窗口随之更新）
+        self.runtime.context_window = effective_context_window(cfg)
         self.state = SessionState.IDLE
         self.query_one("#select-screen").display = False
         self.query_one("#chat").display = True
         self._update_statusbar()
         self.query_one(ChatTextArea).focus()
+
+    def ensure_agent(self) -> Agent | None:
+        """惰性构造常驻 Agent：选定 provider 后构造一次，跨轮复用同一实例。
+
+        Agent 不再是每轮新建——压缩账本、用量锚点等状态挂在 Agent 持有的
+        `runtime` 上，逐轮重建会让决策冻结与熔断器失效。
+        """
+        if self.agent is not None:
+            return self.agent
+        if self.provider is None:
+            return None
+        self.agent = Agent(
+            self.provider,
+            self._tool_registry,
+            self.engine,
+            self._version,
+            runtime=self.runtime,
+        )
+        return self.agent
+
+    def current_defs(self) -> list[ToolDefinition]:
+        """按当前权限模式取本轮工具定义（与主循环同一规则）。"""
+        if self.mode is Mode.PLAN:
+            return self._tool_registry.read_only_definitions()
+        return self._tool_registry.definitions()
 
     def _update_statusbar(self) -> None:
         """刷新底部状态栏：左侧常驻权限模式、右侧模型名 + 累计用量。"""
@@ -273,37 +310,25 @@ class PotatoCodeApp(StreamMixin, App):
         self._activate_provider(cfg)
 
     async def on_chat_submitted(self, event: ChatSubmitted) -> None:
-        """处理输入框提交：/exit /plan /do 命令；IDLE 时发起一轮流式对话。"""
+        """处理输入框提交：斜杠输入走命令分发，其余作为用户消息发起一轮对话。"""
         text = event.text.strip()
         input_box = self.query_one(ChatTextArea)
-
-        if text == "/exit":
-            await self.action_quit()
-            return
         if not text:
             input_box.clear()
             return
-        if self.state is not SessionState.IDLE or self.provider is None:
-            # 流式期间 / 未选定 provider：不接受新提交（保留已输入内容）
+
+        handler, is_command = dispatch_command(text)
+        if is_command:
+            assert handler is not None  # 约定：is_command 为真时必返回处理器
+            if text != "/exit" and (self.state is not SessionState.IDLE or self.provider is None):
+                # 流式期间 / 未选定 provider：除退出外不接受命令（保留已输入内容）
+                return
+            input_box.clear()
+            await handler(self)
             return
 
-        if text == "/plan":
-            # 进入计划模式：仅只读工具 + 计划态系统后缀（F10）
-            input_box.clear()
-            self.mode = Mode.PLAN
-            self.query_one("#log", RichLog).write(
-                notice_block("已进入计划模式（仅只读工具；输入 /do 按计划执行）")
-            )
-            self._update_statusbar()
-            return
-        if text == "/do":
-            # 切回 default 模式，注入执行指令立即按上文计划开跑（/do 本身不入历史）
-            input_box.clear()
-            self.mode = Mode.DEFAULT
-            self._update_statusbar()
-            self.conv.add_user(EXECUTE_DIRECTIVE)
-            self.query_one("#log", RichLog).write(user_block(EXECUTE_DIRECTIVE))
-            self._start_turn()
+        if self.state is not SessionState.IDLE or self.provider is None:
+            # 流式期间 / 未选定 provider：不接受新提交（保留已输入内容）
             return
 
         input_box.clear()

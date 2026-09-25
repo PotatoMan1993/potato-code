@@ -10,16 +10,30 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import cast
 
 from .. import prompt
+from ..compact import (
+    AUTO_SAFETY_MARGIN,
+    MANUAL_SAFETY_MARGIN,
+    SUMMARY_RESERVE,
+    ManageInput,
+    ManageOutput,
+    TriggerKind,
+    estimate_tokens,
+    manage_context,
+    usage_anchor,
+)
 from ..conversation import Conversation
 from ..llm import (
     ROLE_ASSISTANT,
+    PromptTooLongError,
     Provider,
     Request,
     System,
@@ -31,11 +45,16 @@ from ..llm import Usage as LlmUsage
 from ..permission import Decision, Mode, Outcome
 from ..permission.engine import Engine
 from ..tool import DEFAULT_TIMEOUT, Registry
+from .event import CompactEvent, CompactPhase
+from .runtime import SessionRuntime, new_runtime
 
 logger = logging.getLogger(__name__)
 
 # 工具行 / 结果摘要里展示的参数预览最大长度
 _ARGS_PREVIEW_LIMIT = 80
+
+# 需要记录文件追踪的工具名（供压缩后恢复段展示最近读过的文件）
+READ_FILE_TOOL = "read_file"
 
 # 迭代上限兜底（F2-2：避免失控烧 token；内置常量，不配置化）
 MAX_ITERATIONS: int = 25
@@ -104,6 +123,7 @@ class Event:
     notice: str = ""  # 系统提示（停止原因等），仅用于 UI 展示，不入对话历史
     done: bool = False  # 本轮（整个 Loop）结束
     err: Exception | None = None  # 出错（不中断会话）
+    compact: CompactEvent | None = None  # 上下文压缩生命周期事件（自动 / 紧急路径）
 
 
 @dataclass
@@ -162,11 +182,17 @@ class Agent:
         registry: Registry,
         engine: Engine,
         version: str = "",
+        *,
+        runtime: SessionRuntime | None = None,
     ) -> None:
         self._provider = provider
         self._registry = registry
         self._version = version
         self.engine = engine  # 权限引擎：前四层判定，实际运行由 cli/tui 注入
+        # 长生命周期状态由 TUI 跨轮持有；未注入时自建一份（测试与脚本场景）
+        self.runtime = runtime if runtime is not None else new_runtime()
+        # 用 asyncio.Lock 保证 run 与 run_force_compact 不并发触发上下文管理
+        self._run_lock = asyncio.Lock()
 
     async def run(
         self,
@@ -174,7 +200,62 @@ class Agent:
         mode: Mode,
         cancel: asyncio.Event,
     ) -> AsyncIterator[Event]:
-        """执行 Agent Loop，以 async generator 吐出事件流。"""
+        """执行 Agent Loop，以 async generator 吐出事件流。
+
+        入口先持会话级锁：手动 `/compact` 必须等本轮 run 结束才能触发压缩，
+        避免两条路径并发改写同一份对话历史。
+        """
+        async with self._run_lock:
+            async for ev in self._run_iterations(conv, mode, cancel):
+                yield ev
+
+    async def run_force_compact(
+        self,
+        conv: Conversation,
+        tool_defs: list[ToolDefinition] | None = None,
+    ) -> tuple[int, int]:
+        """手动 `/compact` 入口：跳过阈值与熔断，无条件做一次摘要。
+
+        与 `run` 互斥；返回压缩前后的估算 token，失败时异常向上抛由调用方展示。
+        """
+        async with self._run_lock:
+            defs = self._registry.definitions() if tool_defs is None else tool_defs
+            in_ = self._manage_input(conv, defs, TriggerKind.MANUAL)
+            out = await manage_context(in_)
+            return out.before_tokens, out.after_tokens
+
+    def _manage_input(
+        self,
+        conv: Conversation,
+        defs: list[ToolDefinition],
+        trigger: TriggerKind,
+    ) -> ManageInput:
+        """按当前锚点估算 token 并组装一次上下文管理入参。"""
+        est = estimate_tokens(
+            self.runtime.usage_anchor, conv.messages(), self.runtime.anchor_msg_len
+        )
+        return ManageInput(
+            conv=conv,
+            provider=self._provider,
+            context_window=self.runtime.context_window,
+            tool_defs=defs,
+            replacement=self.runtime.replacement,
+            recovery=self.runtime.recovery,
+            auto_tracking=self.runtime.auto_tracking,
+            session=self.runtime.session,
+            usage_anchor=self.runtime.usage_anchor,
+            anchor_msg_len=self.runtime.anchor_msg_len,
+            estimated_token=est,
+            trigger=trigger,
+        )
+
+    async def _run_iterations(
+        self,
+        conv: Conversation,
+        mode: Mode,
+        cancel: asyncio.Event,
+    ) -> AsyncIterator[Event]:
+        """ReAct 主循环本体：每轮先管理上下文，再请求、执行工具、回灌结果。"""
         # 每次 run 起始采集环境、装配稳定系统提示（普通/规划一致；规划提醒已移出系统通道）
         env_text = prompt.gather_environment(self._version, self._provider.model).render()
         sys = prompt.build_system_prompt()
@@ -196,13 +277,87 @@ class Agent:
                 full = it == 1 or (it - 1) % PLAN_REMINDER_INTERVAL == 0
                 reminder = prompt.plan_reminder(full)
 
+            # —— 请求本轮之前先管理上下文：第 1 层必跑，必要时触发第 2 层摘要 ——
+            in_ = self._manage_input(conv, defs, TriggerKind.AUTO)
+            will_summarize = in_.estimated_token >= self.runtime.context_window - (
+                SUMMARY_RESERVE + AUTO_SAFETY_MARGIN
+            )
+            if will_summarize:  # 只跑第 1 层是静默操作，不发压缩事件
+                yield Event(compact=CompactEvent(phase=CompactPhase.BEFORE_AUTO))
+            out = ManageOutput(before_tokens=in_.estimated_token, after_tokens=in_.estimated_token)
+            mc_err: Exception | None = None
+            try:
+                out = await manage_context(in_)
+            except Exception as e:
+                mc_err = e
+            if will_summarize:
+                yield Event(
+                    compact=CompactEvent(
+                        phase=CompactPhase.AFTER_AUTO,
+                        before=out.before_tokens,
+                        after=out.after_tokens,
+                        err=mc_err,
+                    )
+                )
+            if mc_err is not None:
+                _ensure_assistant_tail(conv, NOTICE_STREAM_ERR)
+                yield Event(err=mc_err)
+                return
+
             # —— 请求本轮：转发文本增量，收集完整响应（含工具调用与用量）——
-            outcome = _StreamOutcome()
-            async for item in self._stream_once(conv, defs, sys, env_text, reminder, cancel):
-                if isinstance(item, _StreamOutcome):
-                    outcome = item
-                else:
-                    yield item
+            emergency_retried = False
+            while True:  # 撞墙重试环路：正常路径只跑一次
+                outcome = _StreamOutcome()
+                async for item in self._stream_once(conv, defs, sys, env_text, reminder, cancel):
+                    if isinstance(item, _StreamOutcome):
+                        outcome = item
+                    else:
+                        yield item
+
+                if outcome.usage is not None:
+                    # 主对话路径用真实用量「替换」锚点（不是累加）；摘要请求不走这里
+                    self.runtime.usage_anchor = usage_anchor(outcome.usage)
+                    self.runtime.anchor_msg_len = conv.length()
+
+                if outcome.ok or cancel.is_set():
+                    break
+
+                err = outcome.err
+                if isinstance(err, PromptTooLongError) and not emergency_retried:
+                    # 撞上下文墙：先做一次紧急压缩，再用新消息列表重试本请求一次
+                    yield Event(compact=CompactEvent(phase=CompactPhase.BEFORE_EMERGENCY))
+                    emg = self._manage_input(conv, defs, TriggerKind.EMERGENCY)
+                    emg_out = ManageOutput(before_tokens=0, after_tokens=0)
+                    emg_err: Exception | None = None
+                    try:
+                        emg_out = await manage_context(emg)
+                    except Exception as e:
+                        emg_err = e
+                    yield Event(
+                        compact=CompactEvent(
+                            phase=CompactPhase.AFTER_EMERGENCY,
+                            before=emg_out.before_tokens,
+                            after=emg_out.after_tokens,
+                            err=emg_err,
+                        )
+                    )
+                    if emg_err is not None:
+                        _ensure_assistant_tail(conv, NOTICE_STREAM_ERR)
+                        yield Event(err=emg_err)
+                        return
+                    # 会话已被重建：锚点清零后用新消息序列重新估算
+                    self.runtime.usage_anchor = 0
+                    self.runtime.anchor_msg_len = 0
+                    est_after = estimate_tokens(0, conv.messages(), 0)
+                    if est_after >= self.runtime.context_window - MANUAL_SAFETY_MARGIN:
+                        # 压完还塞不下：视为不可恢复，不再做第二次紧急压缩
+                        _ensure_assistant_tail(conv, NOTICE_STREAM_ERR)
+                        yield Event(err=err)
+                        return
+                    emergency_retried = True
+                    continue
+
+                break  # 非 PTL 或已重试过：走下面的统一错误收尾
 
             if not outcome.ok:
                 if cancel.is_set():
@@ -512,7 +667,32 @@ class Agent:
     async def _run_tool(self, call: ToolCall) -> ToolResult:
         """执行单个工具调用：受 per-tool 超时约束，恒返回结构化结果（N1）。"""
         r = await self._registry.execute(call.name, call.input, timeout=DEFAULT_TIMEOUT)
+        await self._track_file_read(call, r.is_error)
         return ToolResult(tool_call_id=call.id, content=r.content, is_error=r.is_error)
+
+    async def _track_file_read(self, call: ToolCall, is_error: bool) -> None:
+        """read_file 成功后用磁盘纯净字节记一次文件追踪（供压缩后恢复段使用）。
+
+        工具结果带行号前缀，直接拿来当恢复段会让模型把行号当成代码，因此重读一次磁盘；
+        本方法在工具 worker task 内、结果回灌会话之前 await 完成，保证下一轮
+        `manage_context` 能看到本轮记录。
+        """
+        if is_error or call.name != READ_FILE_TOOL:
+            return
+        try:
+            args = json.loads(call.input) if call.input else {}
+        except ValueError:  # 参数不是合法 JSON：跳过追踪，不影响工具结果回灌
+            return
+        path = args.get("path") if isinstance(args, dict) else None
+        if not isinstance(path, str) or not path:
+            return
+        try:
+            abs_path = str(Path(path).resolve())
+            data = await asyncio.to_thread(Path(abs_path).read_bytes)
+        except OSError as e:  # 读盘失败只影响恢复段素材，不打断对话
+            logger.warning("记录文件追踪失败: %s: %s", path, e)
+            return
+        self.runtime.recovery.record_file(abs_path, data.decode("utf-8", errors="replace"))
 
     def _all_unknown(self, calls: list[ToolCall]) -> bool:
         """整轮调用是否全部未注册（混入任一已注册工具即视为有进展，计数重置）。"""
@@ -534,11 +714,16 @@ __all__ = [
     "NOTICE_STREAM_ERR",
     "NOTICE_UNKNOWN_TOOLS",
     "PLAN_REMINDER_INTERVAL",
+    "READ_FILE_TOOL",
     "Agent",
     "ApprovalRequest",
+    "CompactEvent",
+    "CompactPhase",
     "Event",
     "Mode",
     "Phase",
+    "SessionRuntime",
     "ToolEvent",
     "Usage",
+    "new_runtime",
 ]

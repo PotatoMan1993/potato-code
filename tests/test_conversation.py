@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from potatocode.conversation import Conversation
-from potatocode.llm import ToolCall, ToolResult
+from potatocode.llm import Message, ToolCall, ToolResult
 
 
 def test_empty_at_start():
@@ -83,3 +83,61 @@ def test_last_role():
 
     conv.add_assistant("配置已就绪。")
     assert conv.last_role() == "assistant"
+
+
+def test_replace_history_deep_copy():
+    """replace_history 深拷贝入参：之后修改原列表不影响会话内容。"""
+    conv = Conversation()
+    conv.add_user("旧消息")
+
+    msgs = [Message(role="user", content="摘要"), Message(role="assistant", content="继续")]
+    conv.replace_history(msgs)
+
+    msgs.clear()
+    msgs.append(Message(role="user", content="外部乱改"))
+
+    after = conv.messages()
+    assert [m.content for m in after] == ["摘要", "继续"]
+
+
+def test_replace_history_copies_nested_lists():
+    """深拷贝覆盖 tool_calls / tool_results 子列表，外部改动不回流。"""
+    conv = Conversation()
+    calls = [ToolCall(id="c1", name="read_file", input="{}")]
+    results = [ToolResult(tool_call_id="c1", content="内容")]
+    conv.replace_history(
+        [
+            Message(role="assistant", tool_calls=calls),
+            Message(role="tool", tool_results=results),
+        ]
+    )
+
+    calls.clear()
+    results[0].content = "被改掉了"
+
+    msgs = conv.messages()
+    assert msgs[0].tool_calls[0].id == "c1"
+    assert msgs[1].tool_results[0].content == "内容"
+
+
+def test_replace_history_empty_and_none():
+    """传 None / 空列表都视为清空历史，不抛异常。"""
+    conv = Conversation()
+    conv.add_user("旧消息")
+
+    conv.replace_history(None)
+    assert conv.messages() == []
+
+    conv.add_user("再来一条")
+    conv.replace_history([])
+    assert conv.messages() == []
+    assert conv.length() == 0
+
+
+def test_length_counts_messages():
+    """length 返回消息条数（用量锚点记录当时的条数）。"""
+    conv = Conversation()
+    assert conv.length() == 0
+    conv.add_user("一")
+    conv.add_assistant("二")
+    assert conv.length() == 2

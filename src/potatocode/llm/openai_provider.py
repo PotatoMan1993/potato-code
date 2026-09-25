@@ -19,6 +19,7 @@ import openai
 from openai.types.chat import ChatCompletion, ChatCompletionMessageParam
 
 from . import Message, Request, StreamEvent, ToolCall, ToolDefinition, Usage
+from .errors import is_openai_prompt_too_long, wrap_prompt_too_long
 
 if TYPE_CHECKING:
     from ..config import ProviderConfig
@@ -178,4 +179,8 @@ class OpenAIProvider:
         except asyncio.CancelledError:
             raise  # 调用方 cancel 时正常终止
         except Exception as e:  # 鉴权失败 / 限流 / 网络中断 / 模型不存在等
-            yield StreamEvent(err=e)
+            # 上下文超长包装成哨兵异常：主循环据此走紧急压缩
+            if is_openai_prompt_too_long(e):
+                yield StreamEvent(err=wrap_prompt_too_long(e, "openai 上下文超出窗口"))
+            else:
+                yield StreamEvent(err=e)

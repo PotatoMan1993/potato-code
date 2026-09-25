@@ -18,6 +18,7 @@ from textual.widgets import RichLog, Static
 from ..agent import NOTICE_CANCELLED, Agent, ApprovalRequest, Mode, Phase, ToolEvent
 from ..permission import outcome_for_index
 from ..permission.engine import Engine
+from .commands import format_compact_notice
 from .view import (
     SessionState,
     ToolDisplay,
@@ -66,6 +67,8 @@ class StreamMixin:
 
         def _update_statusbar(self) -> None: ...
 
+        def ensure_agent(self) -> Agent | None: ...
+
     async def _consume_agent_events(self) -> None:
         """消费 agent 事件流：文本进动态区，工具行/结果摘要/提示进 scrollback。
 
@@ -73,9 +76,16 @@ class StreamMixin:
         """
         assert self.provider is not None
         assert self.turn_cancel is not None
-        agent = Agent(self.provider, self._tool_registry, self.engine, self._version)
+        agent = self.ensure_agent()
+        assert agent is not None  # provider 已选定，Agent 必然可构造
         try:
             async for ev in agent.run(self.conv, self.mode, self.turn_cancel):
+                if ev.compact is not None:
+                    # 压缩生命周期提示：只写系统消息，不进对话历史（F24a/F24b）
+                    self.query_one("#log", RichLog).write(  # type: ignore[attr-defined]
+                        notice_block(format_compact_notice(ev.compact))
+                    )
+                    continue
                 if ev.approval is not None:
                     # 人在回路（F8）：切 APPROVING、暂停读事件，等用户决策
                     self.pending = ev.approval

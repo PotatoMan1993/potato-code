@@ -9,7 +9,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import tempfile
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import pytest
 
@@ -24,9 +26,19 @@ from potatocode.agent import (
     Event,
     Mode,
     Phase,
+    new_runtime,
 )
+from potatocode.compact import estimate_tokens
 from potatocode.conversation import Conversation
-from potatocode.llm import Request, StreamEvent, System, ToolCall, ToolDefinition
+from potatocode.llm import (
+    PromptTooLongError,
+    Request,
+    StreamEvent,
+    System,
+    ToolCall,
+    ToolDefinition,
+    ToolResult,
+)
 from potatocode.llm import Usage as LlmUsage
 from potatocode.permission import Outcome, new_engine
 from potatocode.permission.engine import Engine
@@ -40,8 +52,16 @@ def _engine(root: str | None = None) -> Engine:
 
 
 def _make_agent(provider, registry: Registry, root: str | None = None) -> Agent:
-    """构造带权限引擎的 Agent（默认根 cwd；写 tmp_path 的用例传 root=str(tmp_path)）。"""
-    return Agent(provider, registry, _engine(root))
+    """构造带权限引擎与会话运行时的 Agent。
+
+    会话落盘目录固定放在临时目录：这些用例只关心会话行为，不该往工作目录写文件。
+    """
+    return Agent(
+        provider,
+        registry,
+        _engine(root),
+        runtime=new_runtime(workspace=root or tempfile.mkdtemp(prefix="potatocode-test-")),
+    )
 
 
 class FakeProvider:
@@ -74,7 +94,7 @@ class FakeProvider:
 
     async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
         self.calls += 1
-        self.tools_seen.append(list(req.tools))
+        self.tools_seen.append(list(req.tools or []))
         self.systems_seen.append(req.system)
         self.reminders_seen.append(req.reminder)
         if self.calls <= len(self._scripts):
@@ -706,7 +726,9 @@ async def test_deny_feedback_loop_continues(tmp_path):
             [StreamEvent(text="换个项目内路径"), StreamEvent(done=True)],
         ]
     )
-    agent = Agent(provider, new_default_registry(), eng)
+    agent = Agent(
+        provider, new_default_registry(), eng, runtime=new_runtime(workspace=str(tmp_path))
+    )
     conv = Conversation()
     conv.add_user("读一个文件")
 
@@ -731,7 +753,9 @@ async def test_mixed_batch_deny_and_allow_order(tmp_path):
             [StreamEvent(text="完成"), StreamEvent(done=True)],
         ]
     )
-    agent = Agent(provider, new_default_registry(), eng)
+    agent = Agent(
+        provider, new_default_registry(), eng, runtime=new_runtime(workspace=str(tmp_path))
+    )
     conv = Conversation()
     conv.add_user("混合批")
 
@@ -760,7 +784,9 @@ async def test_ask_approval_allow_once(tmp_path):
             [StreamEvent(text="写好了"), StreamEvent(done=True)],
         ]
     )
-    agent = Agent(provider, new_default_registry(), eng)
+    agent = Agent(
+        provider, new_default_registry(), eng, runtime=new_runtime(workspace=str(tmp_path))
+    )
     conv = Conversation()
     conv.add_user("写文件")
 
@@ -796,7 +822,9 @@ async def test_ask_approval_deny_once(tmp_path):
             [StreamEvent(text="换个做法"), StreamEvent(done=True)],
         ]
     )
-    agent = Agent(provider, new_default_registry(), eng)
+    agent = Agent(
+        provider, new_default_registry(), eng, runtime=new_runtime(workspace=str(tmp_path))
+    )
     conv = Conversation()
     conv.add_user("写文件")
 
@@ -822,7 +850,9 @@ async def test_ask_approval_allow_forever(tmp_path):
             [StreamEvent(text="完成"), StreamEvent(done=True)],
         ]
     )
-    agent = Agent(provider, new_default_registry(), eng)
+    agent = Agent(
+        provider, new_default_registry(), eng, runtime=new_runtime(workspace=str(tmp_path))
+    )
     conv = Conversation()
     conv.add_user("跑命令")
 
@@ -846,7 +876,7 @@ async def test_read_only_batch_no_approval(tmp_path):
             [StreamEvent(text="完成"), StreamEvent(done=True)],
         ]
     )
-    agent = Agent(provider, reg, eng)
+    agent = Agent(provider, reg, eng, runtime=new_runtime(workspace=str(tmp_path)))
     conv = Conversation()
     conv.add_user("并发只读")
 
@@ -871,7 +901,9 @@ async def test_cancel_during_approval(tmp_path):
             )
         ]
     )
-    agent = Agent(provider, new_default_registry(), eng)
+    agent = Agent(
+        provider, new_default_registry(), eng, runtime=new_runtime(workspace=str(tmp_path))
+    )
     conv = Conversation()
     conv.add_user("写文件")
 
@@ -895,3 +927,383 @@ async def test_cancel_during_approval(tmp_path):
     assert msgs[-1].role == "assistant"
     assert msgs[-1].content == NOTICE_CANCELLED
     assert msgs[-2].role == "tool"
+
+
+# ────────── 上下文管理集成（ch08） ──────────
+
+
+class AnchorSpy(FakeProvider):
+    """在每次发起请求前记录 Agent 当前的用量锚点，用于验证「替换而非累加」。"""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.agent: Agent | None = None
+        self.anchors: list[int] = []
+
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+        if self.agent is not None:
+            self.anchors.append(self.agent.runtime.usage_anchor)
+        async for ev in super().stream(req):
+            yield ev
+
+
+class RawToolsProvider(FakeProvider):
+    """按引用记录每次请求的 tools 列表（不做拷贝），用于比对对象同一性。"""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.raw_tools: list[list[ToolDefinition]] = []
+
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+        self.raw_tools.append(req.tools)
+        async for ev in super().stream(req):
+            yield ev
+
+
+def _compact_phases(events: list[Event]) -> list[str]:
+    """把事件流里的压缩事件折算成 phase 值序列。"""
+    return [e.compact.phase.value for e in events if e.compact is not None]
+
+
+def _usage(inp: int, out: int) -> StreamEvent:
+    """构造一条只带用量的流事件。"""
+    return StreamEvent(usage=LlmUsage(input_tokens=inp, output_tokens=out))
+
+
+async def test_agent_uses_latest_usage_as_anchor(tmp_path):
+    """I4/I4-bis：每轮 stream 结束后锚点被最新 usage 替换，而不是累加。"""
+    provider = AnchorSpy(
+        scripts=[
+            [
+                StreamEvent(text="先读。"),
+                _usage(900, 100),
+                _tool_call("read_file", '{"path": "a.txt"}'),
+            ],
+            [StreamEvent(text="读完了。"), _usage(1400, 100)],
+        ]
+    )
+    agent = _make_agent(provider, new_default_registry(), root=str(tmp_path))
+    provider.agent = agent
+    conv = Conversation()
+    conv.add_user("读一下 a.txt")
+
+    await _collect(agent, conv)
+
+    assert provider.anchors == [0, 1000]  # 第 2 次请求前的锚点是第 1 轮真实用量
+    assert agent.runtime.usage_anchor == 1500  # 替换为最新一轮（不是 1000 + 1500）
+    # 锚点条数记录的是用量产生当时的会话长度（终稿 assistant 尚未入历史）
+    assert agent.runtime.anchor_msg_len == 3
+    assert conv.length() == 4
+
+
+async def test_agent_summary_request_keeps_anchor(tmp_path):
+    """I4-bis：摘要请求自身的 usage 不写回锚点，锚点只由主对话路径维护。"""
+    provider = FakeProvider(
+        scripts=[
+            [
+                StreamEvent(text="先读。"),
+                _usage(900, 100),
+                _tool_call("read_file", '{"path": "a.txt"}'),
+            ],
+            [StreamEvent(text="<summary>历史摘要</summary>"), _usage(9000, 9000)],  # 摘要请求
+            [StreamEvent(text="完成了。"), _usage(1500, 500)],  # 压缩后的主对话
+        ]
+    )
+    agent = _make_agent(provider, new_default_registry(), root=str(tmp_path))
+    agent.runtime.context_window = 34000  # 阈值 1000：第 2 轮必然触发自动压缩
+    conv = Conversation()
+    conv.add_user("读一下 a.txt")
+
+    await _collect(agent, conv)
+
+    assert provider.calls == 3
+    assert agent.runtime.usage_anchor == 2000  # 摘要请求的 18000 没有写回
+
+
+async def test_agent_tool_defs_identity_shared_with_stream(tmp_path, monkeypatch):
+    """I3：同一轮迭代里 manage_context 与 stream 请求共用同一份工具定义对象。"""
+    import potatocode.agent as agent_mod
+
+    seen: list[list[ToolDefinition]] = []
+    real_manage = agent_mod.manage_context
+
+    async def spy(in_):
+        seen.append(in_.tool_defs)
+        return await real_manage(in_)
+
+    provider = RawToolsProvider(scripts=[[StreamEvent(text="好的。")]])
+    agent = _make_agent(provider, new_default_registry(), root=str(tmp_path))
+    conv = Conversation()
+    conv.add_user("你好")
+    monkeypatch.setattr(agent_mod, "manage_context", spy)
+
+    await _collect(agent, conv)
+
+    assert len(seen) == 1
+    assert seen[0] is provider.raw_tools[0]  # 同一列表引用，而非内容相等
+
+
+async def test_agent_plan_mode_shares_read_only_defs(tmp_path, monkeypatch):
+    """I3：Plan 模式下恢复段与请求都用只读工具集，且仍是同一引用。"""
+    import potatocode.agent as agent_mod
+
+    seen: list[list[ToolDefinition]] = []
+    real_manage = agent_mod.manage_context
+
+    async def spy(in_):
+        seen.append(in_.tool_defs)
+        return await real_manage(in_)
+
+    provider = RawToolsProvider(scripts=[[StreamEvent(text="计划如下。")]])
+    registry = new_default_registry()
+    agent = _make_agent(provider, registry, root=str(tmp_path))
+    conv = Conversation()
+    conv.add_user("规划一下")
+    monkeypatch.setattr(agent_mod, "manage_context", spy)
+
+    await _collect(agent, conv, mode=Mode.PLAN)
+
+    names = {d.name for d in seen[0]}
+    assert names == {d.name for d in registry.read_only_definitions()}
+    assert seen[0] is provider.raw_tools[0]
+
+
+async def test_agent_tracks_read_file(tmp_path):
+    """I5：read_file 成功后写入纯净字节的文件追踪（与磁盘原文逐字节相等）。"""
+    target = tmp_path / "note.txt"
+    target.write_text("第一行\n第二行\n", encoding="utf-8")
+    provider = FakeProvider(
+        scripts=[
+            _turn_with_tools(
+                ToolCall(id="r1", name="read_file", input=json.dumps({"path": str(target)}))
+            ),
+            [StreamEvent(text="读完了。")],
+        ]
+    )
+    agent = _make_agent(provider, new_default_registry(), root=str(tmp_path))
+    conv = Conversation()
+    conv.add_user("读 note.txt")
+
+    await _collect(agent, conv)
+
+    snapshot = agent.runtime.recovery.snapshot()
+    assert len(snapshot) == 1
+    assert snapshot[0].path == str(target.resolve())
+    # 与磁盘原文逐字节相等（不带 read_file 的行号前缀；换行跟随平台写入结果）
+    assert snapshot[0].content == target.read_bytes().decode("utf-8")
+
+
+async def test_agent_only_tracks_read_file(tmp_path):
+    """I5：非 read_file 工具不写入文件追踪。"""
+    provider = FakeProvider(
+        scripts=[
+            _turn_with_tools(ToolCall(id="b1", name="bash", input='{"cmd": "echo hi"}')),
+            [StreamEvent(text="好了。")],
+        ]
+    )
+    agent = _make_agent(provider, new_default_registry(), root=str(tmp_path))
+    conv = Conversation()
+    conv.add_user("跑个命令")
+
+    await _collect(agent, conv)
+
+    assert agent.runtime.recovery.snapshot() == []
+
+
+async def test_agent_emits_auto_compact_events(tmp_path):
+    """I13：越过阈值时 yield BEFORE_AUTO / AFTER_AUTO 一对事件。"""
+    summary = "<summary>## 1 主要请求和意图\n用户要求测试压缩。\n## 2 关键技术概念\n摘要</summary>"
+    provider = FakeProvider(
+        scripts=[
+            [StreamEvent(text=summary)],
+            [StreamEvent(text="压缩后继续。"), _usage(100, 20)],
+        ]
+    )
+    agent = _make_agent(provider, new_default_registry(), root=str(tmp_path))
+    agent.runtime.context_window = 35000  # 阈值 2000
+    conv = Conversation()
+    # 对话总量远超"近期原文"下界（10000 token），压缩后才会真正变小
+    for _ in range(12):
+        conv.add_user("x" * 6000)
+        conv.add_assistant("y" * 6000)
+
+    events = await _collect(agent, conv)
+
+    assert _compact_phases(events) == ["before_auto", "after_auto"]
+    after = [e.compact for e in events if e.compact is not None][1]
+    assert after.err is None
+    assert after.before > after.after
+    # 两个事件之间不得出现正文事件（说明压缩发生在主对话开始之前）
+    first_text = next(i for i, e in enumerate(events) if e.text)
+    last_compact = max(i for i, e in enumerate(events) if e.compact is not None)
+    assert last_compact < first_text
+
+
+async def test_agent_no_compact_event_below_threshold(tmp_path):
+    """I13：估算远低于阈值时不发任何压缩事件。"""
+    provider = FakeProvider(
+        scripts=[
+            _turn_with_tools(ToolCall(id="r1", name="read_file", input='{"path": "a.txt"}')),
+            [StreamEvent(text="好了。")],
+        ]
+    )
+    agent = _make_agent(provider, new_default_registry(), root=str(tmp_path))
+    conv = Conversation()
+    conv.add_user("读 a.txt")
+
+    events = await _collect(agent, conv)
+
+    assert [e for e in events if e.compact is not None] == []
+
+
+async def test_agent_emergency_compact_succeeds(tmp_path):
+    """I6/E6：撞墙 → 紧急压缩 → 用新消息重试一次并成功。"""
+    ptl = PromptTooLongError("prompt is too long")
+    provider = FakeProvider(
+        scripts=[
+            [StreamEvent(err=ptl)],
+            [StreamEvent(text="<summary>历史摘要</summary>")],  # 紧急压缩的摘要请求
+            [StreamEvent(text="重试成功。"), _usage(100, 20)],  # 重试本轮主对话
+        ]
+    )
+    agent = _make_agent(provider, new_default_registry(), root=str(tmp_path))
+    conv = Conversation()
+    conv.add_user("你好")
+
+    events = await _collect(agent, conv)
+
+    assert provider.calls == 3  # 主对话 + 摘要 + 重试，不再多
+    assert _compact_phases(events) == ["before_emergency", "after_emergency"]
+    assert not [e for e in events if e.err is not None]
+    assert any(e.done for e in events)
+    assert agent.runtime.usage_anchor == 120  # 紧急压缩清零后由重试请求重新锚定
+    assert agent.runtime.anchor_msg_len == 3  # 重试请求发出时的会话长度
+
+
+async def test_agent_emergency_compact_re_raise_on_second_ptl(tmp_path):
+    """I6/E6：紧急压缩后的重试仍撞墙 → 上抛错误，不再做第三次。"""
+    ptl = PromptTooLongError("prompt is too long")
+    provider = FakeProvider(
+        scripts=[
+            [StreamEvent(err=ptl)],
+            [StreamEvent(text="<summary>历史摘要</summary>")],
+            [StreamEvent(err=ptl)],
+        ]
+    )
+    agent = _make_agent(provider, new_default_registry(), root=str(tmp_path))
+    conv = Conversation()
+    conv.add_user("你好")
+
+    events = await _collect(agent, conv)
+
+    assert provider.calls == 3
+    assert events[-1].err is ptl
+
+
+async def test_agent_emergency_unrecoverable_when_still_too_big(tmp_path):
+    """E6：压缩后重新估算仍 ≥ 窗口 − 手动余量 → 不重试，直接上抛。"""
+    ptl = PromptTooLongError("prompt is too long")
+    provider = FakeProvider(
+        scripts=[
+            [StreamEvent(err=ptl)],
+            [StreamEvent(text="<summary>历史摘要</summary>")],
+        ]
+    )
+    agent = _make_agent(provider, new_default_registry(), root=str(tmp_path))
+    agent.runtime.context_window = 34000  # 手动余量 3000：需降到 31000 以下才重试
+    for _ in range(3):  # 让自动路径熔断，脚本留给紧急路径使用
+        agent.runtime.auto_tracking.record_failure()
+    conv = Conversation()
+    # 尾部 5 条原文本身就超过 31000 token：压缩后仍会留在"近期原文"里
+    for _ in range(5):
+        conv.add_user("x" * 35000)
+        conv.add_assistant("y" * 35000)
+
+    events = await _collect(agent, conv)
+
+    assert provider.calls == 2  # 主对话 + 摘要请求，没有第二次主对话请求
+    assert events[-1].err is ptl
+
+
+async def test_agent_emergency_offloads_big_tool_results(tmp_path):
+    """E6：紧急压缩先强制跑一次第 1 层，大工具结果被落盘。"""
+    ptl = PromptTooLongError("prompt is too long")
+    provider = FakeProvider(
+        scripts=[
+            [StreamEvent(err=ptl)],
+            [StreamEvent(text="<summary>历史摘要</summary>")],
+            [StreamEvent(text="重试成功。")],
+        ]
+    )
+    agent = _make_agent(provider, new_default_registry(), root=str(tmp_path))
+    conv = Conversation()
+    conv.add_user("读大文件")
+    conv.add_assistant_with_tool_calls("", [ToolCall(id="big", name="read_file", input="{}")])
+    conv.add_tool_results([ToolResult(tool_call_id="big", content="x" * 60000)])
+
+    await _collect(agent, conv)
+
+    spilled = list(Path(agent.runtime.session.spill_dir).iterdir())
+    assert [p.name for p in spilled] == ["big"]
+
+
+async def test_agent_run_force_compact(tmp_path):
+    """C15：run_force_compact 返回压缩前后估算 token，并替换会话历史。"""
+    provider = FakeProvider(scripts=[[StreamEvent(text="<summary>历史摘要</summary>")]])
+    agent = _make_agent(provider, new_default_registry(), root=str(tmp_path))
+    conv = Conversation()
+    conv.add_user("你好")
+    expected_before = estimate_tokens(0, conv.messages(), 0)
+
+    before, after = await agent.run_force_compact(conv)
+
+    assert provider.calls == 1  # 只发了一次摘要请求，没走普通对话
+    assert before == expected_before
+    assert after >= 0
+    assert "## 历史会话摘要" in conv.messages()[0].content
+
+
+async def test_agent_run_and_force_compact_are_serialized(tmp_path):
+    """I12：run 进行中时 run_force_compact 必须等待，两者不并发触发压缩。"""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    summary_requests: list[Request] = []
+
+    class GatedProvider(FakeProvider):
+        """主对话请求阻塞到 release 被置位；摘要请求（无工具）直接返回。"""
+
+        async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+            if not req.tools:
+                summary_requests.append(req)
+                async for ev in super().stream(req):
+                    yield ev
+                return
+            started.set()
+            await release.wait()
+            async for ev in super().stream(req):
+                yield ev
+
+    provider = GatedProvider(
+        scripts=[
+            [StreamEvent(text="<summary>历史摘要</summary>")],  # 手动压缩的摘要请求
+            [StreamEvent(text="主对话完成。")],  # 主对话（被阻塞）
+        ]
+    )
+    agent = _make_agent(provider, new_default_registry(), root=str(tmp_path))
+    conv = Conversation()
+    conv.add_user("你好")
+
+    run_task = asyncio.create_task(_collect(agent, conv))
+    await started.wait()
+    compact_task = asyncio.create_task(agent.run_force_compact(conv))
+    await asyncio.sleep(0.05)
+
+    assert not compact_task.done()  # 手动压缩在等 run 让出会话锁
+    assert summary_requests == []  # 期间没有任何摘要请求发出
+
+    release.set()
+    _, after = await compact_task
+    await run_task
+
+    assert len(summary_requests) == 1  # 压缩在 run 结束后才执行
+    assert after >= 0

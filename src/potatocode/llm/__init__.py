@@ -15,6 +15,14 @@ ROLE_ASSISTANT: Literal["assistant"] = "assistant"
 ROLE_TOOL: Literal["tool"] = "tool"  # 携带工具执行结果的回合
 
 
+class PromptTooLongError(Exception):
+    """Provider 上报上下文超出窗口时统一抛出的哨兵异常。
+
+    各协议的具体异常结构差异大（anthropic.BadRequestError / openai.BadRequestError），
+    适配器统一包装成本异常后由调用方用 `isinstance` 一处判断；原异常挂在 `__cause__`。
+    """
+
+
 @dataclass
 class ToolCall:
     """协议无关地承载模型发起的一次工具调用（流式拼接完成后）。
@@ -82,7 +90,8 @@ class Request:
     """一次流式请求的全部入参（替代 stream 的位置参数，N8）。"""
 
     messages: list[Message] = field(default_factory=list)  # 持久对话历史（不含本轮 reminder）
-    tools: list[ToolDefinition] = field(default_factory=list)  # 本轮工具集（普通=全量/规划=只读）
+    # 本轮工具集（普通=全量/规划=只读）；None 表示本轮不给模型任何工具（如摘要请求）
+    tools: list[ToolDefinition] | None = None
     system: System = field(default_factory=System)  # 稳定系统提示 + 环境段
     reminder: str = ""  # 本轮 system-reminder 内容（已含标签；空=不注入）
 
@@ -139,6 +148,7 @@ def new_provider(cfg: ProviderConfig) -> Provider:
 
 __all__ = [
     "Message",
+    "PromptTooLongError",
     "Provider",
     "Request",
     "StreamEvent",

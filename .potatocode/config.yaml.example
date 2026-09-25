@@ -8,6 +8,8 @@
 #   model     模型名（显示在底部状态栏右侧）
 #   base_url  可选，自定义端点（用于接入兼容服务）；缺省用官方默认端点
 #   thinking  可选，是否开启扩展思考（仅 anthropic 生效），默认 false
+#   context_window 单位 token，可选；未配置时按 protocol 默认（anthropic 200000、openai 128000）。
+#              它决定自动压缩阈值（context_window − 20000 − 13000）与紧急压缩的判定基准。
 
 providers:
   - name: Claude
@@ -15,6 +17,7 @@ providers:
     api_key: sk-ant-xxx
     model: claude-sonnet-4-5
     thinking: true
+    context_window: 200000
 
   # OpenAI 协议示例（按需取消注释）：
   # - name: GPT
