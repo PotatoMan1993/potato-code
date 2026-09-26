@@ -8,6 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from . import GREP_MAX_RESULTS, Result, _parse_args
+from .exclude import is_excluded
 
 # 单行超过该长度视为"超长行"，不再完整搜索，避免读爆内存/假无命中（plan 决策）
 _MAX_LINE_CHARS = 1 << 20
@@ -18,6 +19,7 @@ def _iter_lines(file, max_line_chars: int) -> Iterator[tuple[int, str, bool]]:
     """按块读文件并逐行产出 (行号, 行文本, 是否超长未完整)。
 
     超长行只保留前缀并标记 too_long，避免整行读入内存或卡死搜索。
+    每块只做一次切分，未完成的行尾留到下一块拼接（ch09 F4：原先逐行切分要反复重扫剩余缓冲）。
     """
     lineno = 0
     buf = ""
@@ -33,8 +35,9 @@ def _iter_lines(file, max_line_chars: int) -> Iterator[tuple[int, str, bool]]:
             lineno += 1
             yield lineno, buf[:max_line_chars] + "…", True
             buf = ""
-        while "\n" in buf:
-            line, buf = buf.split("\n", 1)
+        parts = buf.split("\n")  # 整块一次切完
+        buf = parts.pop()  # 尾段是未完成的行，留给下一块
+        for line in parts:
             lineno += 1
             too_long = len(line) > max_line_chars
             yield lineno, line[:max_line_chars] + ("…" if too_long else ""), too_long
@@ -86,6 +89,8 @@ class GrepTool:
             for p in root.rglob(glob_pat):
                 if not p.is_file():
                     continue
+                if is_excluded(p, root):
+                    continue  # 不读噪声目录，省下扫描开销（F1/F2）
                 try:
                     with p.open("r", encoding="utf-8", errors="replace") as f:
                         for lineno, line, too_long in _iter_lines(f, _MAX_LINE_CHARS):

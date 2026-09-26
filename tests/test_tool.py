@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import io
 import json
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -11,7 +13,7 @@ from potatocode.tool import Registry, new_default_registry
 from potatocode.tool.bash import BashTool
 from potatocode.tool.edit_file import EditFileTool
 from potatocode.tool.glob_tool import GlobTool
-from potatocode.tool.grep_tool import GrepTool
+from potatocode.tool.grep_tool import _MAX_LINE_CHARS, GrepTool, _iter_lines
 from potatocode.tool.read_file import ReadFileTool
 from potatocode.tool.write_file import WriteFileTool
 
@@ -199,6 +201,39 @@ async def test_glob_no_match(tmp_path):
     assert r.content == "无匹配"
 
 
+async def test_glob_excludes_noise_dirs(tmp_path):
+    """默认排除隐藏目录与固定噪声目录，配额留给项目自身（ch09 F1/AC1/AC2）。"""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("x", encoding="utf-8")
+    (tmp_path / ".venv" / "lib").mkdir(parents=True)
+    (tmp_path / ".venv" / "lib" / "v.py").write_text("x", encoding="utf-8")
+    (tmp_path / "__pycache__").mkdir()
+    (tmp_path / "__pycache__" / "c.py").write_text("x", encoding="utf-8")
+    (tmp_path / "node_modules" / "pkg").mkdir(parents=True)
+    (tmp_path / "node_modules" / "pkg" / "n.py").write_text("x", encoding="utf-8")
+
+    r = await GlobTool().execute(json.dumps({"pattern": "**/*.py", "path": str(tmp_path)}))
+    assert not r.is_error
+    files = r.content.splitlines()
+    assert "src\\a.py" in files or "src/a.py" in files
+    assert len(files) == 1  # 噪声目录的文件一条都不占配额
+
+
+async def test_glob_escape_hatch(tmp_path):
+    """搜索根指向被排除目录时能搜进去，但根之下的被排除子目录仍排除（ch09 F2/AC4）。"""
+    venv = tmp_path / ".venv"
+    (venv / "lib").mkdir(parents=True)
+    (venv / "lib" / "v.py").write_text("x", encoding="utf-8")
+    (venv / "lib" / "__pycache__").mkdir()
+    (venv / "lib" / "__pycache__" / "c.py").write_text("x", encoding="utf-8")
+
+    r = await GlobTool().execute(json.dumps({"pattern": "**/*.py", "path": str(venv)}))
+    assert not r.is_error
+    files = r.content.splitlines()
+    assert "lib\\v.py" in files or "lib/v.py" in files  # 根自身不再被判定
+    assert not any("__pycache__" in f for f in files)  # 根之下照常生效
+
+
 # ────────── grep ──────────
 
 
@@ -223,3 +258,120 @@ async def test_grep_no_match(tmp_path):
     r = await GrepTool().execute(json.dumps({"pattern": "zzz_no_such", "path": str(tmp_path)}))
     assert not r.is_error
     assert r.content == "无命中"
+
+
+async def test_grep_excludes_noise_dirs(tmp_path):
+    """默认排除噪声目录，不读其中的文件（ch09 F1/AC2）。"""
+    (tmp_path / "a.py").write_text("KEY\n", encoding="utf-8")
+    (tmp_path / ".venv").mkdir()
+    (tmp_path / ".venv" / "b.py").write_text("KEY\n", encoding="utf-8")
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "c.py").write_text("KEY\n", encoding="utf-8")
+
+
+async def test_grep_never_opens_excluded_files(tmp_path, monkeypatch):
+    """排除判定先于文件读取：被排除目录中的文件根本不会被打开（ch09 F1/AC7）。
+
+    直接数 open 调用，而非靠耗时推断——这是"省下读取开销"这一收益的确定性证据。
+    """
+    (tmp_path / "a.py").write_text("KEY\n", encoding="utf-8")
+    (tmp_path / ".venv").mkdir()
+    (tmp_path / ".venv" / "b.py").write_text("KEY\n", encoding="utf-8")
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "c.py").write_text("KEY\n", encoding="utf-8")
+
+    opened: list[str] = []
+    real_open = Path.open
+
+    def spy(self, *args, **kwargs):
+        opened.append(str(self))
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", spy)
+    r = await GrepTool().execute(json.dumps({"pattern": "KEY", "path": str(tmp_path)}))
+    monkeypatch.undo()
+
+    assert not r.is_error
+    assert [Path(p).name for p in opened] == ["a.py"]  # 噪声文件一次都没被打开
+
+    r = await GrepTool().execute(json.dumps({"pattern": "KEY", "path": str(tmp_path)}))
+    assert not r.is_error
+    assert r.content.splitlines() == [f"{tmp_path / 'a.py'}:1:KEY"]
+
+
+async def test_grep_escape_hatch(tmp_path):
+    """搜索根指向被排除目录时 grep 能搜进去（ch09 F2/AC4）。"""
+    venv = tmp_path / ".venv"
+    venv.mkdir()
+    (venv / "b.py").write_text("KEY\n", encoding="utf-8")
+
+    r = await GrepTool().execute(json.dumps({"pattern": "KEY", "path": str(venv)}))
+    assert not r.is_error
+    assert r.content.splitlines() == [f"{venv / 'b.py'}:1:KEY"]
+
+
+async def test_grep_glob_param_combines_with_exclude(tmp_path):
+    """文件名过滤与排除规则叠加生效，互不覆盖（ch09 F3/AC5）。"""
+    (tmp_path / "a.txt").write_text("KEY\n", encoding="utf-8")
+    (tmp_path / "a.py").write_text("KEY\n", encoding="utf-8")
+    (tmp_path / ".venv").mkdir()
+    (tmp_path / ".venv" / "b.txt").write_text("KEY\n", encoding="utf-8")
+
+    r = await GrepTool().execute(
+        json.dumps({"pattern": "KEY", "glob": "*.txt", "path": str(tmp_path)})
+    )
+    assert not r.is_error
+    # 排除先剔除 .venv/b.txt，文件名过滤再剔除 a.py，只剩 a.txt
+    assert r.content.splitlines() == [f"{tmp_path / 'a.txt'}:1:KEY"]
+
+
+# ────────── 逐行扫描（ch09 F4） ──────────
+
+
+def test_iter_lines_ultra_long_line():
+    """超长行只保留前缀并标注 too_long，行号仍连续（ch09 F4/AC9）。"""
+    content = "short1\n" + "X" * (_MAX_LINE_CHARS + 100) + "\nshort2\n"
+    out = list(_iter_lines(io.StringIO(content), _MAX_LINE_CHARS))
+
+    assert [ln for ln, _, _ in out] == [1, 2, 3]  # 行号连续
+    assert out[0][1:] == ("short1", False)
+    assert out[2][1:] == ("short2", False)
+
+    lineno, text, too_long = out[1]
+    assert too_long is True
+    assert text.endswith("…")
+    assert len(text) == _MAX_LINE_CHARS + 1  # 恰好截断到阈值 + 省略号
+
+
+def test_iter_lines_at_threshold_not_truncated():
+    """恰好等于阈值的行不算超长，不截断也不标注（边界）。"""
+    line = "Y" * _MAX_LINE_CHARS
+    out = list(_iter_lines(io.StringIO(line + "\n"), _MAX_LINE_CHARS))
+    assert len(out) == 1
+    _, text, too_long = out[0]
+    assert too_long is False
+    assert text == line
+
+
+def test_iter_lines_long_line_without_newline_at_eof():
+    """文件以无换行的超长行结尾：仍被标记截断，不抛异常（ch09 AC9）。"""
+    out = list(_iter_lines(io.StringIO("Z" * (_MAX_LINE_CHARS + 50)), _MAX_LINE_CHARS))
+    assert len(out) == 1
+    _, text, too_long = out[0]
+    assert too_long is True
+    assert text.endswith("…")
+
+
+def test_iter_lines_memory_bounded():
+    """任意长度超长行都不把整行读进内存：产出文本长度不超过阈值 + 1（ch09 AC9）。"""
+    out = list(_iter_lines(io.StringIO("W" * (_MAX_LINE_CHARS * 3)), _MAX_LINE_CHARS))
+    assert out, "应至少产出一条"
+    assert all(len(text) <= _MAX_LINE_CHARS + 1 for _, text, _ in out)
+
+
+def test_iter_lines_matches_plain_iteration():
+    """普通多行文件：产出的行号与文本与朴素按行读取逐条一致（ch09 AC8 等价性）。"""
+    lines = ["alpha", "beta", "", "gamma delta", "epsilon"]
+    out = list(_iter_lines(io.StringIO("\n".join(lines) + "\n"), _MAX_LINE_CHARS))
+    assert [(ln, text) for ln, text, _ in out] == list(enumerate(lines, start=1))
+    assert all(too_long is False for _, _, too_long in out)

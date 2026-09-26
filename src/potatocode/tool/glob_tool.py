@@ -6,6 +6,7 @@ import asyncio
 from pathlib import Path
 
 from . import GLOB_MAX_RESULTS, Result, _parse_args
+from .exclude import is_excluded
 
 
 class GlobTool:
@@ -47,6 +48,8 @@ class GlobTool:
             for i, p in enumerate(root.glob(pattern)):
                 if not p.is_file():
                     continue
+                if is_excluded(p, root):
+                    continue  # 跳过噪声目录，条数配额留给项目自身（F1/F2）
                 try:
                     rel = str(p.relative_to(root))
                 except ValueError:
