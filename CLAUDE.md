@@ -7,9 +7,12 @@
 
 ## 测试
 
-开发完功能后，用 tmux 做端到端测试：
+开发完功能后，用 tmux 做端到端测试（windows系统请尝试其他方式）：
 
 1. 在 tmux 中启动 PotatoCode
 2. 输入一段真实的对话请求
 3. 观察 PotatoCode 是否正确调用工具、生成回复
 4. 对照 checklist.md 逐项验收
+
+## 提交
+使用git commit提交时，message内容使用中文，并且尽量简要，控制在100字以内
