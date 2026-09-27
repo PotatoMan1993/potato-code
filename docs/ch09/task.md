@@ -133,6 +133,11 @@ print(f'{time.time()-t:.2f}s  返回{len(ls)}条, .venv 占', sum(1 for l in ls 
 1. 只改 `_iter_lines` 函数体中的切分循环。**下面两处分支逐字保留不动**（它们就是超长行语义的实现）：
    - 超长行守卫：`if "\n" not in buf and len(buf) > max_line_chars:` 那一支
    - 文件末尾收尾：`if not chunk:` 里的那一支（含它产出的 `too_long` 用法）
+
+   > **2026-09-27 修订（T5b）：** 上述"超长行守卫逐字保留"的要求**已作废**。该分支本身有缺陷——
+   > 跨多块的超长行会被拆成多条记录、行号递增，后续行号整体错位。保留它会违背 AC9。
+   > 实际做法：引入 `dropping` 状态，超长行剩余部分整段丢弃、不涨行号，直到换行才恢复。
+   > **EOF 收尾分支仍逐字保留**。详见 `evidence/verification.md` AC9 补录与 `plan.md` 决策表。
 2. 把
    ```python
    while "\n" in buf:
@@ -211,6 +216,27 @@ print('基准(旧实现): 2.01~2.21s  1148661 行  95 命中')
 .venv/Scripts/python.exe -m pytest tests/test_tool.py -k iter_lines -v
 ```
 期望：5 个测试全通过。
+
+### T7b: 跨多块超长行的行号回归（2026-09-27 补）
+
+**背景：** T7 的 5 条测试**不足以**保证 AC9。`test_iter_lines_memory_bounded` 用的语料恰好是
+3 倍阈值，但只断言 `len(text) <= _MAX_LINE_CHARS + 1`——旧实现产出 3 条、条条满足该断言，
+于是缺陷被放过。其余测试用的超长行均只溢出不足一个读取块，守卫只触发一次。
+
+**新增 3 条测试：**
+
+6. `test_iter_lines_multi_chunk_long_line_is_one_record` —— `"A" × (阈值×3) + "\nTAIL\n"`：断言行号为 `[1, 2]`（超长行只占 1 行，`TAIL` 是第 2 行）、`TAIL` 的 `too_long` 为 `False`
+7. `test_iter_lines_long_lines_mixed_keep_line_numbers` —— 两个超长行夹在短行之间：断言行号为 `[1,2,3,4,5]`，短行内容与物理行严格对应
+8. `test_iter_lines_never_marks_tail_fragment_as_short` —— 超长行剩余片段不得以 `too_long=False` 混入：断言只产出 1 条且 `too_long is True`
+
+**同时收紧：** `test_iter_lines_memory_bounded` 保持原断言不变（它是"长度有界"的正当断言），
+行号与条数的保证交由上述 3 条承担。
+
+**验证：** 把修复前的实现塞回测试模块，期望第 6/7/8 条 FAIL、第 5 条仍 PASS（证明新测试确实覆盖了旧测试的盲区）。
+```
+.venv/Scripts/python.exe -m pytest tests/test_tool.py -k iter_lines -v
+```
+期望：8 个测试全通过。
 
 ## T8: 全量回归与验收数据采集
 

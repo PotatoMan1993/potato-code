@@ -369,6 +369,47 @@ def test_iter_lines_memory_bounded():
     assert all(len(text) <= _MAX_LINE_CHARS + 1 for _, text, _ in out)
 
 
+def test_iter_lines_multi_chunk_long_line_is_one_record():
+    """跨多块的超长行只产出一条记录、只占一个行号，后续行号不错位（AC9）。
+
+    行长达 3 倍阈值时，守卫分支会在同一物理行上被触发多次；
+    若每次触发都自增行号，该行会被拆成多条记录，后续所有行号被顶高。
+    """
+    out = list(_iter_lines(io.StringIO("A" * (_MAX_LINE_CHARS * 3) + "\nTAIL\n"), _MAX_LINE_CHARS))
+
+    assert [ln for ln, _, _ in out] == [1, 2]  # 超长行占 1 行，TAIL 是第 2 行
+    assert out[1][1:] == ("TAIL", False)
+
+    _, text, too_long = out[0]
+    assert too_long is True
+    assert text.endswith("…")
+    assert len(text) == _MAX_LINE_CHARS + 1
+
+
+def test_iter_lines_long_lines_mixed_keep_line_numbers():
+    """两个超长行夹在短行之间：行号与物理行严格一一对应（AC9）。"""
+    content = "a\n" + "B" * (_MAX_LINE_CHARS * 2) + "\nb\n" + "C" * (_MAX_LINE_CHARS * 4) + "\nc\n"
+    out = list(_iter_lines(io.StringIO(content), _MAX_LINE_CHARS))
+
+    assert [ln for ln, _, _ in out] == [1, 2, 3, 4, 5]  # 行号与物理行一一对应
+    assert [(ln, text, tl) for ln, text, tl in out if ln in (1, 3, 5)] == [
+        (1, "a", False),
+        (3, "b", False),
+        (5, "c", False),
+    ]
+    assert all(too_long is True for ln, _, too_long in out if ln in (2, 4))
+
+
+def test_iter_lines_never_marks_tail_fragment_as_short():
+    """超长行被截断后，剩余片段不得以 too_long=False 混入（AC9）。"""
+    out = list(_iter_lines(io.StringIO("A" * (_MAX_LINE_CHARS * 3) + "\n"), _MAX_LINE_CHARS))
+
+    assert len(out) == 1
+    _, text, too_long = out[0]
+    assert too_long is True
+    assert text.endswith("…")
+
+
 def test_iter_lines_matches_plain_iteration():
     """普通多行文件：产出的行号与文本与朴素按行读取逐条一致（ch09 AC8 等价性）。"""
     lines = ["alpha", "beta", "", "gamma delta", "epsilon"]
