@@ -296,7 +296,7 @@ class Agent:
                         phase=CompactPhase.AFTER_AUTO,
                         before=out.before_tokens,
                         after=out.after_tokens,
-                        err=mc_err,
+                        err=mc_err if mc_err else out.executed_error,
                     )
                 )
             if mc_err is not None:
@@ -338,7 +338,7 @@ class Agent:
                             phase=CompactPhase.AFTER_EMERGENCY,
                             before=emg_out.before_tokens,
                             after=emg_out.after_tokens,
-                            err=emg_err,
+                            err=emg_err if emg_err else out.executed_error,
                         )
                     )
                     if emg_err is not None:
