@@ -16,13 +16,13 @@ def _write(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
-def test_missing_files_are_empty(monkeypatch, tmp_path, capsys):
+def test_missing_files_are_empty(monkeypatch, tmp_path, pkg_logs):
     home = tmp_path / "home"
     root = tmp_path / "root"
     _use_home(monkeypatch, home)
 
     assert load_config(str(root)).servers == {}
-    assert capsys.readouterr().err == ""
+    assert pkg_logs.records == []
 
 
 def test_two_layers_merge_and_project_fully_overrides(monkeypatch, tmp_path):
@@ -63,7 +63,7 @@ mcp_servers:
     assert servers["shared"].args == []
 
 
-def test_invalid_layer_warns_without_hiding_other_layer(monkeypatch, tmp_path, capsys):
+def test_invalid_layer_warns_without_hiding_other_layer(monkeypatch, tmp_path, pkg_logs):
     home = tmp_path / "home"
     root = tmp_path / "root"
     _use_home(monkeypatch, home)
@@ -76,10 +76,11 @@ def test_invalid_layer_warns_without_hiding_other_layer(monkeypatch, tmp_path, c
     config = load_config(str(root))
 
     assert set(config.servers) == {"good"}
-    assert "[mcp] warn: load" in capsys.readouterr().err
+    warned = pkg_logs.text()
+    assert "load" in warned and "failed" in warned
 
 
-def test_environment_expands_only_env_and_headers(monkeypatch, tmp_path, capsys):
+def test_environment_expands_only_env_and_headers(monkeypatch, tmp_path, pkg_logs):
     home = tmp_path / "home"
     root = tmp_path / "root"
     _use_home(monkeypatch, home)
@@ -111,11 +112,10 @@ mcp_servers:
     assert literal.env == {"TOKEN": "prefix-secret-from-host--"}
     assert servers["remote"].url == "https://example.test/${KNOWN_TOKEN}"
     assert servers["remote"].headers == {"Authorization": "Bearer secret-from-host"}
-    err = capsys.readouterr().err
-    assert err.count("${MISSING_TOKEN}") == 1
+    assert pkg_logs.text().count("${MISSING_TOKEN}") == 1
 
 
-def test_invalid_servers_are_skipped_independently(monkeypatch, tmp_path, capsys):
+def test_invalid_servers_are_skipped_independently(monkeypatch, tmp_path, pkg_logs):
     home = tmp_path / "home"
     root = tmp_path / "root"
     _use_home(monkeypatch, home)
@@ -138,10 +138,10 @@ mcp_servers:
     config = load_config(str(root))
 
     assert set(config.servers) == {"good", "extra-fields-ignored"}
-    assert capsys.readouterr().err.count("skip server") == 7
+    assert pkg_logs.text().count("skip server") == 7
 
 
-def test_invalid_document_shapes_degrade(monkeypatch, tmp_path, capsys):
+def test_invalid_document_shapes_degrade(monkeypatch, tmp_path, pkg_logs):
     home = tmp_path / "home"
     root = tmp_path / "root"
     _use_home(monkeypatch, home)
@@ -149,7 +149,7 @@ def test_invalid_document_shapes_degrade(monkeypatch, tmp_path, capsys):
     _write(root / ".potatocode.yaml", "mcp_servers: nope\n")
 
     assert load_config(str(root)).servers == {}
-    assert capsys.readouterr().err.count("must be a mapping") == 2
+    assert pkg_logs.text().count("must be a mapping") == 2
 
 
 def test_documented_example_parses(monkeypatch, tmp_path):

@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
-import sys
 from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass
 from typing import Any
@@ -16,6 +16,8 @@ from mcp.client.stdio import stdio_client
 
 from .config import Config, ServerConfig
 from .tool import McpTool, adapt_tool
+
+logger = logging.getLogger(__name__)
 
 # SDK 2.x 使用 streamable_http_client，1.x 使用 streamablehttp_client。
 create_mcp_http_client: Any = getattr(_streamable_http, "create_mcp_http_client", None)
@@ -75,13 +77,9 @@ class Manager:
         except TimeoutError:
             for worker in self._workers:
                 worker.task.cancel()
-            _warn(f"close timeout ({close_timeout:g}s), some sessions may leak")
+            logger.warning(f"close timeout ({close_timeout:g}s), some sessions may leak")
         except Exception as exc:
-            _warn(f"close failed: {exc}")
-
-
-def _warn(message: str) -> None:
-    print(f"[mcp] warn: {message}", file=sys.stderr)
+            logger.warning(f"close failed: {exc}")
 
 
 async def new_manager(cfg: Config, version: str) -> Manager:
@@ -102,9 +100,9 @@ async def _connect_one(manager: Manager, name: str, server: ServerConfig, versio
     try:
         await asyncio.wait_for(_do_connect(manager, name, server, version), timeout=connect_timeout)
     except TimeoutError:
-        _warn(f"connect server {name} timeout after {connect_timeout:g}s")
+        logger.warning(f"connect server {name} timeout after {connect_timeout:g}s")
     except Exception as exc:
-        _warn(f"connect server {name} failed: {exc}")
+        logger.warning(f"connect server {name} failed: {exc}")
 
 
 async def _do_connect(manager: Manager, name: str, server: ServerConfig, version: str) -> None:
@@ -126,7 +124,7 @@ async def _do_connect(manager: Manager, name: str, server: ServerConfig, version
         manager._sessions.append(_Session(name, session))
         manager._tools.extend(tools)
         manager._workers.append(_Worker(stop, task))
-    print(f"[mcp] connected server {name}: {len(tools)} tool(s)", file=sys.stderr)
+    logger.info(f"connected server {name}: {len(tools)} tool(s)")
 
 
 async def _session_worker(
@@ -192,7 +190,7 @@ def _adapt_tools(name: str, remote_tools: list[Any], session: ClientSession) -> 
         if tool is None:
             continue
         if tool.full_name in tools:
-            _warn(f"duplicate tool {tool.full_name}: keeping later definition")
+            logger.warning(f"duplicate tool {tool.full_name}: keeping later definition")
         tools[tool.full_name] = tool
     return list(tools.values())
 

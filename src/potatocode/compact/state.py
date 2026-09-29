@@ -20,6 +20,9 @@ from .const import MAX_CONSECUTIVE_AUTO_COMPACT_FAILURES
 
 logger = logging.getLogger(__name__)
 
+# 会话日志文件名。会话目录布局由本模块定义，日志装配只接收完整路径，故常量放在这里
+LOG_FILENAME = "session.log"
+
 # 决策回调返回值语义：kept=保留原文、replaced=替换、skip=本轮放弃（下次重试）
 DECISION_KEPT = "kept"
 DECISION_REPLACED = "replaced"
@@ -28,10 +31,11 @@ DECISION_SKIP = "skip"
 
 @dataclass
 class SessionContext:
-    """会话生命周期信息：会话 id 与工具结果落盘目录。"""
+    """会话生命周期信息：会话 id、工具结果落盘目录与日志文件路径。"""
 
     session_id: str  # 形如 <unix_ts>-<short_random>
     spill_dir: str  # .potatocode/sessions/<session_id>/tool-results
+    log_path: str  # .potatocode/sessions/<session_id>/session.log
 
 
 def _new_session_id() -> str:
@@ -47,9 +51,14 @@ def _new_session_id() -> str:
 def new_session_context(workspace: str) -> SessionContext:
     """新建会话上下文并确保落盘目录存在（已存在不算错误）。"""
     session_id = _new_session_id()
-    spill_dir = str(Path(workspace) / ".potatocode" / "sessions" / session_id / "tool-results")
-    Path(spill_dir).mkdir(parents=True, exist_ok=True)
-    return SessionContext(session_id=session_id, spill_dir=spill_dir)
+    session_dir = Path(workspace) / ".potatocode" / "sessions" / session_id
+    spill_dir = str(session_dir / "tool-results")
+    Path(spill_dir).mkdir(parents=True, exist_ok=True)  # 连带建出会话目录，日志文件共用该目录
+    return SessionContext(
+        session_id=session_id,
+        spill_dir=spill_dir,
+        log_path=str(session_dir / LOG_FILENAME),
+    )
 
 
 class ContentReplacementState:

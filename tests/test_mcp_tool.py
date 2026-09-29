@@ -74,9 +74,9 @@ def test_schema_and_annotations_are_none_safe():
 
 
 @pytest.mark.parametrize(("server", "name"), [("bad.server", "tool"), ("server", "bad@tool")])
-def test_illegal_full_name_is_skipped(server, name, capsys):
+def test_illegal_full_name_is_skipped(server, name, pkg_logs):
     assert adapt_tool(server, _remote_tool(name=name), StubSession()) is None
-    assert "name contains illegal characters" in capsys.readouterr().err
+    assert "name contains illegal characters" in pkg_logs.text()
 
 
 @pytest.mark.asyncio
@@ -147,7 +147,7 @@ async def test_execute_timeout_is_structured(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_non_text_is_dropped_and_warned_once(capsys):
+async def test_non_text_is_dropped_and_warned_once(pkg_logs):
     tool_module._non_text_warn_once.clear()
     mixed = _result(
         mtypes.TextContent(text="visible"),
@@ -160,7 +160,7 @@ async def test_non_text_is_dropped_and_warned_once(capsys):
     second = await tool.execute("{}")
 
     assert first.content == second.content == "visible"
-    assert capsys.readouterr().err.count("non-text content") == 1
+    assert pkg_logs.text().count("non-text content") == 1
 
 
 @pytest.mark.asyncio

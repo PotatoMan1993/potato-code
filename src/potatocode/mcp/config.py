@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 _ENV_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
@@ -45,10 +47,6 @@ class _RawServer:
     headers: Any = None
 
 
-def _warn(message: str) -> None:
-    print(f"[mcp] warn: {message}", file=sys.stderr)
-
-
 def _load_file(path: Path) -> dict[str, _RawServer]:
     """读取单层配置；文件或结构非法时把该层降级为空。"""
     if not path.exists():
@@ -57,26 +55,26 @@ def _load_file(path: Path) -> dict[str, _RawServer]:
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, yaml.YAMLError) as exc:
-        _warn(f"load {path} failed: {exc}")
+        logger.warning(f"load {path} failed: {exc}")
         return {}
 
     if data is None:
         return {}
     if not isinstance(data, dict):
-        _warn(f"load {path} failed: top-level YAML value must be a mapping")
+        logger.warning(f"load {path} failed: top-level YAML value must be a mapping")
         return {}
 
     raw_servers = data.get("mcp_servers")
     if raw_servers is None:
         return {}
     if not isinstance(raw_servers, dict):
-        _warn(f"load {path} failed: mcp_servers must be a mapping")
+        logger.warning(f"load {path} failed: mcp_servers must be a mapping")
         return {}
 
     servers: dict[str, _RawServer] = {}
     for name, value in raw_servers.items():
         if not isinstance(name, str) or not isinstance(value, dict):
-            _warn(f"skip server {name}: definition must be a mapping with a string name")
+            logger.warning(f"skip server {name}: definition must be a mapping with a string name")
             continue
         servers[name] = _RawServer(
             type=value.get("type"),
@@ -121,7 +119,7 @@ def _apply_expansion(name: str, server: _RawServer) -> None:
         setattr(server, attr, expanded)
 
     for variable in sorted(undefined):
-        _warn(f"undefined env var ${{{variable}}} referenced by server {name}")
+        logger.warning(f"undefined env var ${{{variable}}} referenced by server {name}")
 
 
 def _merge_servers(
@@ -154,28 +152,28 @@ def _string_list(value: Any, field_name: str) -> tuple[list[str] | None, str | N
 def _validate_server(name: str, server: _RawServer) -> ServerConfig | None:
     """把原始定义转换成安全、完整的 ServerConfig。"""
     if server.type not in ("stdio", "http"):
-        _warn(f"skip server {name}: type must be 'stdio' or 'http'")
+        logger.warning(f"skip server {name}: type must be 'stdio' or 'http'")
         return None
 
     if server.type == "stdio":
         if not isinstance(server.command, str) or not server.command:
-            _warn(f"skip server {name}: stdio server requires a non-empty command")
+            logger.warning(f"skip server {name}: stdio server requires a non-empty command")
             return None
         args, args_error = _string_list(server.args, "args")
         env, env_error = _string_map(server.env, "env")
         error = args_error or env_error
         if error is not None:
-            _warn(f"skip server {name}: {error}")
+            logger.warning(f"skip server {name}: {error}")
             return None
         assert args is not None and env is not None
         return ServerConfig(type="stdio", command=server.command, args=args, env=env)
 
     if not isinstance(server.url, str) or not server.url:
-        _warn(f"skip server {name}: http server requires a non-empty url")
+        logger.warning(f"skip server {name}: http server requires a non-empty url")
         return None
     headers, headers_error = _string_map(server.headers, "headers")
     if headers_error is not None:
-        _warn(f"skip server {name}: {headers_error}")
+        logger.warning(f"skip server {name}: {headers_error}")
         return None
     assert headers is not None
     return ServerConfig(type="http", url=server.url, headers=headers)
@@ -187,13 +185,13 @@ def load_config(root: str) -> Config:
         user_path = Path.home() / ".potatocode" / "config.yaml"
         user = _load_file(user_path)
     except Exception as exc:  # Path.home 等平台异常也不能阻断启动
-        _warn(f"load user config failed: {exc}")
+        logger.warning(f"load user config failed: {exc}")
         user = {}
 
     try:
         project = _load_file(Path(root) / ".potatocode.yaml")
     except Exception as exc:
-        _warn(f"load project config failed: {exc}")
+        logger.warning(f"load project config failed: {exc}")
         project = {}
 
     for name, server in user.items():
@@ -206,7 +204,7 @@ def load_config(root: str) -> Config:
         try:
             normalized = _validate_server(name, server)
         except Exception as exc:
-            _warn(f"skip server {name}: validation failed: {exc}")
+            logger.warning(f"skip server {name}: validation failed: {exc}")
             continue
         if normalized is not None:
             valid[name] = normalized

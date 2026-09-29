@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
-import sys
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 import mcp.types as mtypes
 
 from ..tool import Result
+
+logger = logging.getLogger(__name__)
 
 call_timeout: float = 30.0
 
@@ -80,10 +82,7 @@ class McpTool:
 
         if dropped_non_text and self.full_name not in _non_text_warn_once:
             _non_text_warn_once.add(self.full_name)
-            print(
-                f"[mcp] warn: tool {self.full_name} returned non-text content blocks (dropped)",
-                file=sys.stderr,
-            )
+            logger.warning(f"tool {self.full_name} returned non-text content blocks (dropped)")
 
         is_error = getattr(result, "is_error", getattr(result, "isError", False))
         return Result(content="\n".join(texts), is_error=is_error is True)
@@ -110,10 +109,7 @@ def adapt_tool(server_name: str, tool: mtypes.Tool, session: CallerSession) -> M
     """校验并适配一个远端工具；非法名称不会暴露给 LLM。"""
     full_name = f"mcp__{server_name}__{tool.name}"
     if _VALID_NAME.fullmatch(full_name) is None:
-        print(
-            f"[mcp] warn: skip tool {full_name}: name contains illegal characters",
-            file=sys.stderr,
-        )
+        logger.warning(f"skip tool {full_name}: name contains illegal characters")
         return None
 
     description = tool.description or f"来自 MCP server {server_name} 的工具 {tool.name}"

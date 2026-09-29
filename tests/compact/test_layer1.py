@@ -159,7 +159,11 @@ def test_offload_spill_failure_retryable(tmp_path):
     """落盘失败降级为不替换且不写账本，下一轮重新尝试落盘。"""
     blocked = tmp_path / "blocked"
     blocked.write_text("我是文件不是目录", encoding="utf-8")  # 以其为父目录必然写失败
-    session = SessionContext(session_id="s", spill_dir=str(blocked / "tool-results"))
+    session = SessionContext(
+        session_id="s",
+        spill_dir=str(blocked / "tool-results"),
+        log_path=str(blocked / "session.log"),
+    )
     conv = _conv_with_results(["x" * 60000])
     state = ContentReplacementState()
 

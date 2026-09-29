@@ -31,12 +31,20 @@ class SessionRuntime:
     # 字段读写都在 asyncio 单线程事件循环内完成，无需额外加锁
 
 
-def new_runtime(workspace: str = ".", context_window: int = 200000) -> SessionRuntime:
-    """按工作目录新建一份默认运行时（含落盘目录）。"""
+def new_runtime(
+    workspace: str = ".",
+    context_window: int = 200000,
+    session: SessionContext | None = None,
+) -> SessionRuntime:
+    """按工作目录新建一份默认运行时（含落盘目录）。
+
+    传入 session 时复用它而不新建：启动最前端为了先建日志出口已经建过一份会话，
+    复用可保证日志文件与运行时指向同一个会话（见 docs/ch10/spec.md F2）。
+    """
     return SessionRuntime(
         replacement=ContentReplacementState(),
         recovery=RecoveryState(),
         auto_tracking=CompactCircuitBreaker(),
-        session=new_session_context(workspace),
+        session=session if session is not None else new_session_context(workspace),
         context_window=context_window,
     )

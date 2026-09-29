@@ -1,4 +1,4 @@
-"""PotatoCode 入口：加载配置、启动 TUI。
+"""PotatoCode 入口：装配日志出口、加载配置、启动 TUI。
 
 banner 由 TUI 在 on_mount 时写入对话区（见 tui/app.py），此处不重复打印。
 """
@@ -6,29 +6,51 @@ banner 由 TUI 在 on_mount 时写入对话区（见 tui/app.py），此处不�
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 from pathlib import Path
 
 from . import __version__, config, mcp, permission
 from .agent import new_runtime
+from .compact import SessionContext, new_session_context
 from .config import ConfigError
+from .logging_setup import close_logging, setup_logging
 from .tool import new_default_registry
 from .tui import PotatoCodeApp
+
+logger = logging.getLogger(__name__)
 
 # 运行期配置文件路径（含真实密钥，已被 .gitignore 忽略）
 CONFIG_PATH = ".potatocode/config.yaml"
 
 
 async def _amain() -> int:
-    """异步入口：让 MCP 会话覆盖完整的 TUI 生命周期。"""
+    """异步入口：先建会话与日志出口，再走主体流程，最后收尾出口。
+
+    会话标识必须早于配置读取诞生——配置错误、MCP 连接失败等启动早期事件也要能
+    落进该会话的日志（docs/ch10/spec.md F2）。日志出口装配失败时降级为无日志运行，
+    不阻断启动（N4）。
+    """
+    root = str(Path.cwd().resolve())
+    session = new_session_context(root)
+    handler = setup_logging(session.log_path)
+    logger.info("启动：session=%s workspace=%s", session.session_id, root)
+    try:
+        return await _run(root, session)
+    finally:
+        close_logging(handler)  # 刷新并关闭出口，保证日志尾部不残缺（F9）
+
+
+async def _run(root: str, session: SessionContext) -> int:
+    """主体流程：配置 → MCP → 权限引擎 → 运行时 → TUI，共用启动时建好的会话。"""
     try:
         cfg = config.load(CONFIG_PATH)
     except ConfigError as e:
-        # N4：可读错误提示，而非崩溃堆栈
+        # N4：可读错误提示，而非崩溃堆栈；同时留一条日志便于事后追溯（F2）
+        logger.error("配置错误: %s", e)
         print(f"配置错误: {e}", file=sys.stderr)
         return 1
 
-    root = str(Path.cwd().resolve())
     registry = new_default_registry()
     manager = await mcp.new_manager(mcp.load_config(root), version=__version__)
     try:
@@ -37,9 +59,10 @@ async def _amain() -> int:
         # 权限引擎（五层防御的前四层）：根于项目目录；解析失败仅降级提示、继续启动
         engine, err = permission.new_engine(root)
         if err is not None:
+            logger.warning("权限引擎降级: %s", err)
             print(f"权限引擎降级: {err}", file=sys.stderr)
-        # 会话级运行时：会话目录 + 压缩账本，注入 TUI 后跨轮复用
-        runtime = new_runtime(workspace=root)
+        # 会话级运行时：复用启动时建好的会话，使日志文件与运行时指向同一会话（F1/F2）
+        runtime = new_runtime(workspace=root, session=session)
         await PotatoCodeApp(
             cfg.providers, __version__, registry, engine, manager, runtime=runtime
         ).run_async()

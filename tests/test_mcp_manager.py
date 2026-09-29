@@ -43,7 +43,7 @@ async def test_empty_config_starts_and_closes():
 
 
 @pytest.mark.asyncio
-async def test_failures_are_isolated_and_results_are_sorted(monkeypatch, capsys):
+async def test_failures_are_isolated_and_results_are_sorted(monkeypatch, pkg_logs):
     async def fake_connect(manager, name, server, version):
         if name == "broken":
             raise RuntimeError("cannot connect")
@@ -66,12 +66,12 @@ async def test_failures_are_isolated_and_results_are_sorted(monkeypatch, capsys)
         "mcp__alpha__echo",
         "mcp__zeta__echo",
     ]
-    assert "connect server broken failed: cannot connect" in capsys.readouterr().err
+    assert "connect server broken failed: cannot connect" in pkg_logs.text()
     await manager.close()
 
 
 @pytest.mark.asyncio
-async def test_connect_timeout_does_not_block_startup(monkeypatch, capsys):
+async def test_connect_timeout_does_not_block_startup(monkeypatch, pkg_logs):
     async def blocked(*args):
         await asyncio.Event().wait()
 
@@ -82,12 +82,12 @@ async def test_connect_timeout_does_not_block_startup(monkeypatch, capsys):
     manager = await asyncio.wait_for(new_manager(config, "test"), timeout=0.2)
 
     assert manager.tools() == []
-    assert "timeout after 0.02s" in capsys.readouterr().err
+    assert "timeout after 0.02s" in pkg_logs.text()
     await manager.close()
 
 
 @pytest.mark.asyncio
-async def test_close_timeout_is_bounded(monkeypatch, capsys):
+async def test_close_timeout_is_bounded(monkeypatch, pkg_logs):
     @asynccontextmanager
     async def blocked_context():
         try:
@@ -101,7 +101,7 @@ async def test_close_timeout_is_bounded(monkeypatch, capsys):
 
     await asyncio.wait_for(manager.close(), timeout=0.2)
 
-    assert "close timeout (0.02s)" in capsys.readouterr().err
+    assert "close timeout (0.02s)" in pkg_logs.text()
 
 
 @pytest.mark.asyncio
