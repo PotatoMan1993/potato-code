@@ -8,13 +8,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from datetime import timedelta
 from pathlib import Path
 
-from . import __version__, config, mcp, permission
+from . import __version__, config, instructions, mcp, memory, permission, session
 from .agent import new_runtime
-from .compact import SessionContext, new_session_context
+from .compact import SessionContext, new_session_context, sessions_root
 from .config import ConfigError
 from .logging_setup import close_logging, setup_logging
+from .memory import project_memory_dir, user_memory_dir
 from .tool import new_default_registry
 from .tui import PotatoCodeApp
 
@@ -22,6 +24,9 @@ logger = logging.getLogger(__name__)
 
 # 运行期配置文件路径（含真实密钥，已被 .gitignore 忽略）
 CONFIG_PATH = ".potatocode/config.yaml"
+
+# 会话保留期：超过即由启动时的后台清理任务删除
+SESSION_MAX_AGE = timedelta(days=30)
 
 
 async def _amain() -> int:
@@ -32,17 +37,20 @@ async def _amain() -> int:
     不阻断启动（N4）。
     """
     root = str(Path.cwd().resolve())
-    session = new_session_context(root)
-    handler = setup_logging(session.log_path)
-    logger.info("启动：session=%s workspace=%s", session.session_id, root)
+    ses_ctx = new_session_context(root)
+    handler = setup_logging(ses_ctx.log_path)
+    logger.info("启动：session=%s workspace=%s", ses_ctx.session_id, root)
     try:
-        return await _run(root, session)
+        return await _run(root, ses_ctx)
     finally:
         close_logging(handler)  # 刷新并关闭出口，保证日志尾部不残缺（F9）
 
 
-async def _run(root: str, session: SessionContext) -> int:
-    """主体流程：配置 → MCP → 权限引擎 → 运行时 → TUI，共用启动时建好的会话。"""
+async def _run(root: str, ses_ctx: SessionContext) -> int:
+    """主体流程：配置 → 指令/记忆 → MCP → 权限引擎 → 运行时 → TUI。
+
+    会话沿用启动时建好的那一份，使日志文件、JSONL 存档、工具结果落盘同处一个会话目录。
+    """
     try:
         cfg = config.load(CONFIG_PATH)
     except ConfigError as e:
@@ -50,6 +58,20 @@ async def _run(root: str, session: SessionContext) -> int:
         logger.error("配置错误: %s", e)
         print(f"配置错误: {e}", file=sys.stderr)
         return 1
+
+    # 项目指令与长期记忆：进程启动时各加载一次，之后按需注入系统提示（ch11 F8/F32）
+    instruction_text = instructions.Loader(root).load()
+    mem_mgr = memory.Manager(project_memory_dir(root), user_memory_dir())
+    memory_text = mem_mgr.load_index()
+    logger.info("指令 %d 字符，记忆索引 %d 字符", len(instruction_text), len(memory_text))
+
+    # 会话存档写入器：每条消息实时追加到 conversation.jsonl（ch11 F13/F15）
+    writer = session.Writer(ses_ctx.session_dir)
+    # 过期会话清理放后台任务，不阻塞启动（ch11 F26）
+    cleanup = asyncio.create_task(
+        asyncio.to_thread(session.clean_expired, sessions_root(root), SESSION_MAX_AGE)
+    )
+    cleanup.add_done_callback(_log_cleanup)
 
     registry = new_default_registry()
     manager = await mcp.new_manager(mcp.load_config(root), version=__version__)
@@ -62,15 +84,36 @@ async def _run(root: str, session: SessionContext) -> int:
             logger.warning("权限引擎降级: %s", err)
             print(f"权限引擎降级: {err}", file=sys.stderr)
         # 会话级运行时：复用启动时建好的会话，使日志文件与运行时指向同一会话（F1/F2）
-        runtime = new_runtime(workspace=root, session=session)
+        runtime = new_runtime(workspace=root, session=ses_ctx)
         await PotatoCodeApp(
-            cfg.providers, __version__, registry, engine, manager, runtime=runtime
+            cfg.providers,
+            __version__,
+            registry,
+            engine,
+            manager,
+            runtime=runtime,
+            writer=writer,
+            mem_mgr=mem_mgr,
+            instruction_text=instruction_text,
+            memory_text=memory_text,
+            sessions_dir=sessions_root(root),
+            workspace=root,
         ).run_async()
     except KeyboardInterrupt:
         pass  # 终端层的 Ctrl+C，安静退出
     finally:
+        writer.close()  # TUI 已退出，存档句柄在此兜底关闭
         await manager.close()
     return 0
+
+
+def _log_cleanup(task: asyncio.Task) -> None:
+    """记录后台清理结果（被取消或失败都不影响主流程）。"""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("过期会话清理失败: %s", exc)
 
 
 def main() -> None:

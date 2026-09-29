@@ -28,6 +28,7 @@ class SessionRuntime:
     context_window: int = 200000  # 当前 provider 的上下文窗口（token）
     usage_anchor: int = 0  # 上一次主对话 stream 的真实用量之和；摘要请求不更新
     anchor_msg_len: int = 0  # 记录锚点时的会话条数，供增量估算划界
+    turn_count: int = 0  # 已自然完成的对话轮数（ch11：每 5 轮触发一次记忆更新）
     # 字段读写都在 asyncio 单线程事件循环内完成，无需额外加锁
 
 

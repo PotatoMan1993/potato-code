@@ -31,6 +31,7 @@ from potatocode.agent import (
 from potatocode.compact import estimate_tokens
 from potatocode.conversation import Conversation
 from potatocode.llm import (
+    Message,
     PromptTooLongError,
     Request,
     StreamEvent,
@@ -1307,3 +1308,204 @@ async def test_agent_run_and_force_compact_are_serialized(tmp_path):
 
     assert len(summary_requests) == 1  # 压缩在 run 结束后才执行
     assert after >= 0
+
+
+# ────────── 项目指令 / 长期记忆注入与记忆更新触发（ch11 F35/F43） ──────────
+
+
+class FakeMemoryManager:
+    """只记录调用的假记忆管理器：这些用例只验证「何时触发」，不验证 LLM 行为。"""
+
+    def __init__(self) -> None:
+        self.provider = object()  # 非 None 即视为可用（Agent 只做空值判断）
+        self.updated: list[list[Message]] = []
+
+    async def update_async(self, msgs: list[Message]) -> None:
+        self.updated.append(list(msgs))
+
+    def load_index(self) -> str:
+        return ""
+
+
+def _text_provider(text: str = "好的。") -> FakeProvider:
+    """每轮都返回同一句纯文本的 provider（自然完成，无工具调用）。"""
+    return FakeProvider(repeat=[StreamEvent(text=text), StreamEvent(done=True)])
+
+
+async def test_instruction_and_memory_injected_into_system_prompt(tmp_path):
+    """指令与记忆文本进稳定系统提示，落在固定模块之后（F43/AC27）。"""
+    provider = _text_provider()
+    agent = Agent(
+        provider,
+        new_default_registry(),
+        _engine(str(tmp_path)),
+        runtime=new_runtime(workspace=str(tmp_path)),
+        instruction_text="项目规范：代码块必须带语言标记",
+        memory_text="- [user_preference] 简洁回复",
+    )
+    conv = Conversation()
+    conv.add_user("你好")
+
+    await _collect(agent, conv)
+
+    stable = provider.systems_seen[0].stable
+    assert "项目规范：代码块必须带语言标记" in stable
+    assert "[user_preference] 简洁回复" in stable
+    assert stable.index("你是 PotatoCode") < stable.index("项目规范")
+
+
+async def test_memory_index_reread_from_manager(tmp_path):
+    """挂了记忆管理器时每轮现读索引（上一轮写下的笔记下一轮即可见，F32）。"""
+
+    class LiveManager(FakeMemoryManager):
+        def __init__(self) -> None:
+            super().__init__()
+            self.index = ""
+
+        def load_index(self) -> str:
+            return self.index
+
+    mgr = LiveManager()
+    provider = _text_provider()
+    agent = Agent(
+        provider,
+        new_default_registry(),
+        _engine(str(tmp_path)),
+        runtime=new_runtime(workspace=str(tmp_path)),
+        memory_manager=mgr,
+    )
+    conv = Conversation()
+    conv.add_user("第一轮")
+    await _collect(agent, conv)
+    assert "第一轮记下的偏好" not in provider.systems_seen[0].stable
+
+    mgr.index = "- [user_preference] 第一轮记下的偏好"
+    conv.add_user("第二轮")
+    await _collect(agent, conv)
+
+    assert "第一轮记下的偏好" in provider.systems_seen[1].stable
+
+
+async def test_memory_update_triggered_every_five_turns(tmp_path):
+    """连续五轮自然结束后触发一次记忆更新，且只带本轮消息（F35-①）。"""
+    mgr = FakeMemoryManager()
+    agent = Agent(
+        _text_provider(),
+        new_default_registry(),
+        _engine(str(tmp_path)),
+        runtime=new_runtime(workspace=str(tmp_path)),
+        memory_manager=mgr,
+    )
+    conv = Conversation()
+    for i in range(5):
+        conv.add_user(f"第{i}问")
+        await _collect(agent, conv)
+    await asyncio.sleep(0)  # 让后台更新任务跑完
+
+    assert agent.runtime.turn_count == 5
+    assert len(mgr.updated) == 1
+    assert mgr.updated[0][0].content == "第4问"  # 从最后一条 user 消息起算
+
+
+async def test_memory_update_triggered_by_keyword(tmp_path):
+    """本轮用户消息含"记住"时立即触发一次更新（F35-②）。"""
+    mgr = FakeMemoryManager()
+    agent = Agent(
+        _text_provider(),
+        new_default_registry(),
+        _engine(str(tmp_path)),
+        runtime=new_runtime(workspace=str(tmp_path)),
+        memory_manager=mgr,
+    )
+    conv = Conversation()
+    conv.add_user("记住：本项目统一用中文回复")
+    await _collect(agent, conv)
+    await asyncio.sleep(0)
+
+    assert len(mgr.updated) == 1
+    assert "记住" in mgr.updated[0][0].content
+
+
+async def test_memory_update_not_triggered_on_plain_turn(tmp_path):
+    """普通一轮（无关键词、未到 5 轮）不触发更新。"""
+    mgr = FakeMemoryManager()
+    agent = Agent(
+        _text_provider(),
+        new_default_registry(),
+        _engine(str(tmp_path)),
+        runtime=new_runtime(workspace=str(tmp_path)),
+        memory_manager=mgr,
+    )
+    conv = Conversation()
+    conv.add_user("今天天气怎么样")
+    await _collect(agent, conv)
+    await asyncio.sleep(0)
+
+    assert mgr.updated == []
+
+
+async def test_memory_update_skipped_without_manager(tmp_path):
+    """未注入记忆管理器时一切照旧（向后兼容，AC28）。"""
+    agent = _make_agent(_text_provider(), new_default_registry(), root=str(tmp_path))
+    conv = Conversation()
+    conv.add_user("记住这件事")
+    events = await _collect(agent, conv)
+
+    assert any(ev.done for ev in events)
+    assert agent.runtime.turn_count == 1  # 轮数照常累计
+
+
+async def test_memory_update_skipped_when_provider_not_selected(tmp_path):
+    """记忆管理器尚未绑定 provider 时不触发（启动早期场景）。"""
+    mgr = FakeMemoryManager()
+    mgr.provider = None
+    agent = Agent(
+        _text_provider(),
+        new_default_registry(),
+        _engine(str(tmp_path)),
+        runtime=new_runtime(workspace=str(tmp_path)),
+        memory_manager=mgr,
+    )
+    conv = Conversation()
+    conv.add_user("记住这件事")
+    await _collect(agent, conv)
+    await asyncio.sleep(0)
+
+    assert mgr.updated == []
+
+
+async def test_memory_update_does_not_block_next_turn(tmp_path):
+    """记忆更新还在跑时下一轮对话照常开始（F36/AC24）。"""
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    class SlowMemoryManager(FakeMemoryManager):
+        async def update_async(self, msgs: list[Message]) -> None:
+            started.set()
+            await release.wait()  # 模拟耗时提炼
+            await super().update_async(msgs)
+
+    mgr = SlowMemoryManager()
+    agent = Agent(
+        _text_provider(),
+        new_default_registry(),
+        _engine(str(tmp_path)),
+        runtime=new_runtime(workspace=str(tmp_path)),
+        memory_manager=mgr,
+    )
+    conv = Conversation()
+
+    conv.add_user("记住这件事")
+    first = await _collect(agent, conv)  # 本轮结束不依赖更新完成
+    assert any(ev.done for ev in first)
+    await started.wait()
+    assert mgr.updated == []  # 更新仍卡在 release 上
+
+    conv.add_user("下一轮问题")
+    second = await _collect(agent, conv)  # 用户能立刻继续对话
+    assert any(ev.done for ev in second)
+
+    release.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert len(mgr.updated) == 1  # 释放后更新才真正跑完

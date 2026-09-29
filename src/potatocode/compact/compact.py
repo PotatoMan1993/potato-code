@@ -56,7 +56,7 @@ class ManageOutput:
 
     before_tokens: int
     after_tokens: int
-    executed_error: str | None = None     # 执行失败或者未执行时
+    executed_error: str | None = None  # 执行失败或者未执行时
 
 
 def auto_threshold(context_window: int) -> int:
@@ -104,12 +104,20 @@ async def _manage(in_: ManageInput) -> ManageOutput:
     if in_.context_window <= SUMMARY_RESERVE + AUTO_SAFETY_MARGIN:
         # 窗口过小：阈值非正会让每轮都触发摘要，直接跳过自动第 2 层
         logger.warning("context_window=%d 过小，跳过自动压缩", in_.context_window)
-        executed_error= f"context_window={in_.context_window} 过小，跳过自动压缩"
-        return ManageOutput(before_tokens=in_.estimated_token, after_tokens=est_tokens, executed_error=executed_error)
+        executed_error = f"context_window={in_.context_window} 过小，跳过自动压缩"
+        return ManageOutput(
+            before_tokens=in_.estimated_token,
+            after_tokens=est_tokens,
+            executed_error=executed_error,
+        )
 
     if est_tokens < auto_threshold(in_.context_window) or in_.auto_tracking.tripped():
         executed_error = f"current_context={est_tokens} 小于自动压缩触发阈值，跳过自动压缩"
-        return ManageOutput(before_tokens=in_.estimated_token, after_tokens=est_tokens, executed_error=executed_error)
+        return ManageOutput(
+            before_tokens=in_.estimated_token,
+            after_tokens=est_tokens,
+            executed_error=executed_error,
+        )
 
     new_msgs, before, after = await auto_compact(in_)
     in_.conv.replace_history(new_msgs)

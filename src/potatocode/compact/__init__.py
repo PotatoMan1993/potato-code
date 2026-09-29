@@ -24,6 +24,9 @@ from .state import (
     RecoveryState,
     SessionContext,
     new_session_context,
+    open_session_context,
+    parse_session_time,
+    sessions_root,
 )
 from .token import estimate_tokens, message_chars, usage_anchor
 
@@ -46,5 +49,8 @@ __all__ = [
     "manage_context",
     "message_chars",
     "new_session_context",
+    "open_session_context",
+    "parse_session_time",
+    "sessions_root",
     "usage_anchor",
 ]

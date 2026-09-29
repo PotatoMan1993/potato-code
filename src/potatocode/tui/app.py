@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 
@@ -17,18 +18,31 @@ from textual.widgets import RichLog, Static, TextArea
 
 from ..agent import Agent, ApprovalRequest
 from ..agent.runtime import SessionRuntime, new_runtime
+from ..compact import sessions_root
 from ..config import ProviderConfig, effective_context_window
 from ..conversation import Conversation
 from ..llm import Provider, ToolDefinition, new_provider
 from ..mcp import Manager
+from ..memory import Manager as MemoryManager
 from ..permission import Mode, Outcome
 from ..permission.engine import Engine
 from ..prompt import render_banner
+from ..session import SessionInfo, Writer
 from ..tool import Registry
 from .commands import dispatch_command
+from .resume import ResumeSelect, do_resume_session
 from .select import ProviderSelect
 from .stream import StreamMixin
-from .view import SessionState, ToolDisplay, notice_block, statusbar_content, user_block
+from .view import (
+    SessionState,
+    ToolDisplay,
+    notice_block,
+    statusbar_content,
+    user_block,
+    write_notice,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def next_mode(mode: Mode) -> Mode:
@@ -154,6 +168,23 @@ class PotatoCodeApp(StreamMixin, App):
         height: auto;
         border: round $accent;
     }
+    #resume-screen {
+        height: auto;
+        margin: 2 4;
+        display: none;
+    }
+    #resume-title {
+        text-style: bold;
+    }
+    #resume-hint {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #resume-list {
+        height: auto;
+        max-height: 80%;
+        border: round $accent;
+    }
     #statusbar {
         dock: bottom;
         height: 1;
@@ -177,6 +208,12 @@ class PotatoCodeApp(StreamMixin, App):
         engine: Engine,
         manager: Manager | None = None,
         runtime: SessionRuntime | None = None,
+        writer: Writer | None = None,
+        mem_mgr: MemoryManager | None = None,
+        instruction_text: str = "",
+        memory_text: str = "",
+        sessions_dir: str = "",
+        workspace: str = "",
     ) -> None:
         super().__init__()
         self.providers = providers
@@ -190,7 +227,14 @@ class PotatoCodeApp(StreamMixin, App):
         self.runtime = runtime if runtime is not None else new_runtime()
         self.agent: Agent | None = None  # 常驻 Agent，选定 provider 后构造一次
         self.compact_task: asyncio.Task | None = None  # 后台手动压缩任务
-        self.conv = Conversation()
+        # 会话存档与长期记忆（ch11）：未注入时保持无持久化的旧行为（测试与脚本场景）
+        self.workspace = workspace or os.getcwd()
+        self.sessions_dir = sessions_dir or sessions_root(self.workspace)
+        self.writer = writer
+        self.mem_mgr = mem_mgr
+        self._instruction_text = instruction_text
+        self._memory_text = memory_text
+        self.conv = self._new_conversation([])
         self.state = SessionState.IDLE
         self.cur_reply = ""
         self.turn_start = 0.0
@@ -221,6 +265,10 @@ class PotatoCodeApp(StreamMixin, App):
         with Vertical(id="select-screen"):
             yield Static("选择一个 provider：", id="select-title")
             yield ProviderSelect(self.providers, id="select")
+        with Vertical(id="resume-screen"):
+            yield Static("选择要恢复的会话：", id="resume-title")
+            yield Static("", id="resume-hint")
+            yield ResumeSelect(id="resume-list")
         yield Static(id="statusbar")
 
     def on_mount(self) -> None:
@@ -255,11 +303,25 @@ class PotatoCodeApp(StreamMixin, App):
         self.provider = new_provider(cfg)
         self.agent = None  # 换 provider 后重建 Agent（上下文窗口随之更新）
         self.runtime.context_window = effective_context_window(cfg)
+        if self.writer is not None:  # 首行落盘带的模型名（ch11 F11）
+            self.writer.set_model(cfg.model)
+        if self.mem_mgr is not None:  # 记忆更新的 provider 与主会话一致（ch11 F37）
+            self.mem_mgr.set_provider(self.provider, cfg.model)
         self.state = SessionState.IDLE
         self.query_one("#select-screen").display = False
         self.query_one("#chat").display = True
         self._update_statusbar()
         self.query_one(ChatTextArea).focus()
+
+    def current_model(self) -> str:
+        """当前模型名（未选定 provider 时为空串）。"""
+        return self.provider.model if self.provider is not None else ""
+
+    def current_defs(self) -> list[ToolDefinition]:
+        """按当前权限模式取本轮工具定义（与主循环同一规则）。"""
+        if self.mode is Mode.PLAN:
+            return self._tool_registry.read_only_definitions()
+        return self._tool_registry.definitions()
 
     def ensure_agent(self) -> Agent | None:
         """惰性构造常驻 Agent：选定 provider 后构造一次，跨轮复用同一实例。
@@ -277,14 +339,72 @@ class PotatoCodeApp(StreamMixin, App):
             self.engine,
             self._version,
             runtime=self.runtime,
+            memory_manager=self.mem_mgr,
+            instruction_text=self._instruction_text,
+            memory_text=self._memory_text,
         )
         return self.agent
 
-    def current_defs(self) -> list[ToolDefinition]:
-        """按当前权限模式取本轮工具定义（与主循环同一规则）。"""
-        if self.mode is Mode.PLAN:
-            return self._tool_registry.read_only_definitions()
-        return self._tool_registry.definitions()
+    # ────────────────────── 会话恢复（ch11） ──────────────────────
+
+    def _new_conversation(self, msgs: list) -> Conversation:
+        """按当前 writer 构造 Conversation（无 writer 时不挂持久化回调）。"""
+        if self.writer is None:
+            return Conversation.from_messages(list(msgs))
+        return Conversation.from_messages(
+            list(msgs), on_append=self.writer.on_append, on_replace=self.writer.on_replace
+        )
+
+    def enter_resume_mode(self, items: list[SessionInfo]) -> None:
+        """进入会话选择界面（隐藏对话区，仅显示列表）。"""
+        select = self.query_one(ResumeSelect)
+        select.set_sessions(items)
+        self.state = SessionState.RESUMING
+        self.query_one("#chat").display = False
+        self.query_one("#resume-screen").display = True
+        select.focus()
+        self.update_resume_hint()
+
+    def leave_resume_mode(self) -> None:
+        """退出会话选择界面，回到空闲态。"""
+        self.query_one("#resume-screen").display = False
+        self.query_one("#chat").display = True
+        self.state = SessionState.IDLE
+        self._refocus_input()
+
+    def update_resume_hint(self) -> None:
+        """刷新列表下方的提示行（总数 / 过滤结果数 / 当前搜索词）。"""
+        select = self.query_one(ResumeSelect)
+        parts = [f"{select.shown_count}/{select.total} 个会话"]
+        if select.filter_text:
+            parts.append(f"搜索：{select.filter_text}")
+        parts.append("↑↓ 选择 · 输入过滤 · Enter 恢复 · Esc 取消")
+        self.query_one("#resume-hint", Static).update(" · ".join(parts))
+
+    async def cancel_resume(self) -> None:
+        """Esc：放弃恢复，当前会话保持不变。"""
+        if self.state is not SessionState.RESUMING:
+            return
+        self.leave_resume_mode()
+
+    async def commit_resume(self, index: int | None) -> None:
+        """Enter：恢复选中的会话（恢复期间不接受新的输入）。"""
+        if self.state is not SessionState.RESUMING:
+            return
+        info = self.query_one(ResumeSelect).session_at(index)
+        if info is None:
+            return
+        self.query_one("#resume-list").disabled = True  # 防重复触发
+        try:
+            await do_resume_session(self, info)
+        finally:
+            self.query_one("#resume-list").disabled = False
+            self.leave_resume_mode()
+
+    def on_unmount(self) -> None:
+        """退出时收尾：关闭会话存档文件句柄（F16）。"""
+        if self.writer is not None:
+            self.writer.close()
 
     def _update_statusbar(self) -> None:
         """刷新底部状态栏：左侧常驻权限模式、右侧模型名 + 累计用量。"""
@@ -302,7 +422,11 @@ class PotatoCodeApp(StreamMixin, App):
     # ────────────────────── 事件处理 ──────────────────────
 
     def on_option_list_option_selected(self, event: ProviderSelect.OptionSelected) -> None:
-        """选择界面按 Enter 选定 provider。"""
+        """选择界面按 Enter 选定 provider。
+
+        会话恢复列表是另一个 OptionList，其按键由 ResumeSelect 自行处理（F19/F46），
+        这里只认 provider 选择界面。
+        """
         if self.state is not SessionState.SELECTING:
             return
         select = self.query_one(ProviderSelect)
@@ -320,6 +444,14 @@ class PotatoCodeApp(StreamMixin, App):
         handler, is_command = dispatch_command(text)
         if is_command:
             assert handler is not None  # 约定：is_command 为真时必返回处理器
+            if text == "/resume" and self.state in (
+                SessionState.STREAMING,
+                SessionState.APPROVING,
+            ):
+                # 运行中不允许恢复（F46/AC29）：明确回话而不是静默吞掉
+                input_box.clear()
+                write_notice(self, "请等待当前任务完成")
+                return
             if text != "/exit" and (self.state is not SessionState.IDLE or self.provider is None):
                 # 流式期间 / 未选定 provider：除退出外不接受命令（保留已输入内容）
                 return

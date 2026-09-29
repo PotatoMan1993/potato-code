@@ -78,13 +78,14 @@ def fixed_modules() -> list[Module]:
     ]
 
 
-def optional_modules() -> list[Module]:
-    """三个可选空槽（自定义指令 / 已激活 Skill / 长期记忆），content 为空。
+def optional_modules(instructions: str = "", memory: str = "") -> list[Module]:
+    """三个可选槽（自定义指令 / 已激活 Skill / 长期记忆）。
 
-    本章不接入真实内容来源，装配时自动跳过；后续章节填入内容即可挂载（AC2）。
+    自定义指令与长期记忆的内容由调用方注入（ch11 F43）：为空则装配时自动跳过，
+    不留下多余空行；已激活 Skill 仍留空待后续章节接入。
     """
     return [
-        Module(name="自定义指令", priority=80, content=""),
+        Module(name="自定义指令", priority=80, content=instructions),
         Module(name="已激活 Skill", priority=90, content=""),
-        Module(name="长期记忆", priority=100, content=""),
+        Module(name="长期记忆", priority=100, content=memory),
     ]

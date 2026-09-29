@@ -157,3 +157,40 @@ def test_plan_reminder_full_and_concise():
     assert "<system-reminder>" in concise
     assert "PLAN MODE" in concise
     assert len(concise) < len(full)
+
+
+# ────────── 指令与记忆注入（ch11 F43/AC27） ──────────
+
+
+def test_optional_modules_accept_injected_content():
+    """可选槽按参数填充内容：空参数仍是空槽（F43）。"""
+    mods = optional_modules(instructions="项目规范", memory="记忆索引")
+    by_priority = {m.priority: m.content for m in mods}
+    assert by_priority[80] == "项目规范"
+    assert by_priority[90] == ""
+    assert by_priority[100] == "记忆索引"
+
+
+def test_build_system_prompt_injects_instructions_and_memory():
+    """非空参数分别落到自定义指令与长期记忆槽位，且排在固定模块之后（AC27）。"""
+    s = build_system_prompt("项目规范：代码块必须带语言标记", "- [user_preference] 简洁回复")
+
+    assert "项目规范：代码块必须带语言标记" in s
+    assert "- [user_preference] 简洁回复" in s
+    # 固定模块（10..70）在前，自定义指令（80）在长期记忆（100）之前
+    assert s.index("你是 PotatoCode") < s.index("项目规范")
+    assert s.index("项目规范：代码块必须带语言标记") < s.index("[user_preference]")
+
+
+def test_build_system_prompt_empty_args_match_previous_output():
+    """传空字符串时与旧版无参调用逐字节一致（AC27 向后兼容）。"""
+    assert build_system_prompt("", "") == assemble_system(fixed_modules() + optional_modules())
+
+
+def test_build_system_prompt_skips_empty_slot():
+    """只给记忆不给指令时，指令槽位被跳过、不留空行。"""
+    only_memory = build_system_prompt("", "记忆内容")
+
+    assert "记忆内容" in only_memory
+    assert "\n\n\n" not in only_memory
+    assert build_system_prompt("", "") != only_memory

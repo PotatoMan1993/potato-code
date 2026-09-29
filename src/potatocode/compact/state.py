@@ -31,34 +31,74 @@ DECISION_SKIP = "skip"
 
 @dataclass
 class SessionContext:
-    """会话生命周期信息：会话 id、工具结果落盘目录与日志文件路径。"""
+    """会话生命周期信息：会话 id、会话目录、工具结果落盘目录与日志文件路径。"""
 
-    session_id: str  # 形如 <unix_ts>-<short_random>
-    spill_dir: str  # .potatocode/sessions/<session_id>/tool-results
-    log_path: str  # .potatocode/sessions/<session_id>/session.log
+    session_id: str  # 形如 20260601-143022-a1b2
+    spill_dir: str  # <session_dir>/tool-results
+    log_path: str  # <session_dir>/session.log
+    # 会话落盘根目录（JSONL 存档与工具结果同居一地）；带默认值以兼容旧构造调用
+    session_dir: str = ""
+
+
+def sessions_root(workspace: str) -> str:
+    """返回会话存档根目录：`<workspace>/.potatocode/sessions`。"""
+    return str(Path(workspace) / ".potatocode" / "sessions")
 
 
 def _new_session_id() -> str:
-    """生成 `<unix_ts>-<short_random>` 形式的会话 id（进程内一次性）。"""
+    """生成 `YYYYMMDD-HHMMSS-xxxx` 形式的会话 id（进程内一次性）。
+
+    本地时间可读、可直接从 id 前 15 位解析出启动时刻（供过期清理与排序），
+    4 位随机十六进制后缀防同秒碰撞。
+    """
     try:
-        rand = secrets.token_hex(4)
+        rand = secrets.token_hex(2)
     except Exception as e:  # 熵源异常极少见：降级为随机数生成器，不阻断启动
         logger.warning("secrets 取随机串失败，降级为 random: %s", e)
-        rand = random.Random(time.time()).randbytes(4).hex()
-    return f"{int(time.time())}-{rand}"
+        rand = random.Random(time.time()).randbytes(2).hex()
+    return f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{rand}"
+
+
+def _session_dir(workspace: str, session_id: str) -> Path:
+    """会话目录：`<workspace>/.potatocode/sessions/<session_id>`。"""
+    return Path(sessions_root(workspace)) / session_id
 
 
 def new_session_context(workspace: str) -> SessionContext:
     """新建会话上下文并确保落盘目录存在（已存在不算错误）。"""
     session_id = _new_session_id()
-    session_dir = Path(workspace) / ".potatocode" / "sessions" / session_id
+    session_dir = _session_dir(workspace, session_id)
     spill_dir = str(session_dir / "tool-results")
     Path(spill_dir).mkdir(parents=True, exist_ok=True)  # 连带建出会话目录，日志文件共用该目录
     return SessionContext(
         session_id=session_id,
         spill_dir=spill_dir,
         log_path=str(session_dir / LOG_FILENAME),
+        session_dir=str(session_dir),
     )
+
+
+def open_session_context(workspace: str, session_id: str) -> SessionContext:
+    """打开已有会话目录（恢复场景）：只拼路径，不创建任何目录。"""
+    session_dir = _session_dir(workspace, session_id)
+    return SessionContext(
+        session_id=session_id,
+        spill_dir=str(session_dir / "tool-results"),
+        log_path=str(session_dir / LOG_FILENAME),
+        session_dir=str(session_dir),
+    )
+
+
+def parse_session_time(session_id: str) -> datetime | None:
+    """从会话 id 前 15 位解析 `YYYYMMDD-HHMMSS` 启动时刻。
+
+    旧格式（`<unix_ts>-<hex>`，ch08 遗留）解析失败返回 None：这类目录在新章节里
+    既不进会话列表也不参与过期清理（N3 向后兼容）。
+    """
+    try:
+        return datetime.strptime(session_id[:15], "%Y%m%d-%H%M%S")
+    except (TypeError, ValueError):
+        return None
 
 
 class ContentReplacementState:

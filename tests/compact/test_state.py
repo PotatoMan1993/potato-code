@@ -12,19 +12,24 @@ from potatocode.compact import (
     ContentReplacementState,
     RecoveryState,
     new_session_context,
+    open_session_context,
+    parse_session_time,
 )
 from potatocode.compact.state import FileReadRecord
 
 
 def test_new_session_context(tmp_path):
-    """会话 id 形如 <unix_ts>-<hex>，落盘目录被真实创建，两次调用互不相同。"""
+    """会话 id 形如 YYYYMMDD-HHMMSS-xxxx，落盘目录被真实创建，两次调用互不相同。"""
     first = new_session_context(str(tmp_path))
     second = new_session_context(str(tmp_path))
 
-    assert re.fullmatch(r"\d+-[0-9a-f]{8}", first.session_id)
+    assert re.fullmatch(r"\d{8}-\d{6}-[0-9a-f]{4}", first.session_id)
     assert first.session_id != second.session_id
     assert Path(first.spill_dir).is_dir()
     assert Path(first.spill_dir).parent.name == first.session_id
+    # 会话目录字段与落盘目录一致（ch11 F10）
+    assert Path(first.session_dir).name == first.session_id
+    assert Path(first.spill_dir).parent == Path(first.session_dir)
 
 
 def test_new_session_context_rand_fail_fallback(tmp_path, monkeypatch):
@@ -35,8 +40,25 @@ def test_new_session_context_rand_fail_fallback(tmp_path, monkeypatch):
 
     monkeypatch.setattr("potatocode.compact.state.secrets.token_hex", boom)
     session = new_session_context(str(tmp_path))
-    assert re.fullmatch(r"\d+-[0-9a-f]{8}", session.session_id)
+    assert re.fullmatch(r"\d{8}-\d{6}-[0-9a-f]{4}", session.session_id)
     assert Path(session.spill_dir).is_dir()
+
+
+def test_open_session_context_does_not_create(tmp_path):
+    """恢复场景只拼路径不建目录（ch11 T1）。"""
+    ctx = open_session_context(str(tmp_path), "20260601-143022-a1b2")
+
+    assert ctx.session_id == "20260601-143022-a1b2"
+    assert Path(ctx.session_dir).name == ctx.session_id
+    assert Path(ctx.spill_dir) == Path(ctx.session_dir) / "tool-results"
+    assert not Path(ctx.session_dir).exists()
+
+
+def test_parse_session_time():
+    """新格式解析出启动时刻；旧格式（unix 秒前缀）返回 None（ch11 F9/N3）。"""
+    assert parse_session_time("20260601-143022-a1b2") == datetime(2026, 6, 1, 14, 30, 22)
+    assert parse_session_time("1717000000-abc12345") is None
+    assert parse_session_time("not-a-session") is None
 
 
 def test_decide_once_freeze_kept():

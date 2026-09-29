@@ -42,7 +42,7 @@ def _iter_lines(file, max_line_chars: int) -> Iterator[tuple[int, str, bool]]:
             if nl < 0:
                 buf = ""
                 continue
-            buf = buf[nl + 1:]
+            buf = buf[nl + 1 :]
             dropping = False
 
         if "\n" not in buf and len(buf) > max_line_chars:

@@ -23,6 +23,7 @@ class SessionState(Enum):
     IDLE = "idle"  # 等待用户输入
     STREAMING = "streaming"  # 等待/接收模型流（loading + 计时）
     APPROVING = "approving"  # 等待用户在人在回路菜单上做选择（F8）
+    RESUMING = "resuming"  # /resume 的历史会话选择界面（ch11 F19）
 
 
 @dataclass
@@ -157,3 +158,13 @@ def notice_block(text: str) -> RenderableType:
         Text(""),
         Text(text, style="dim italic"),
     )
+
+
+def write_notice(app, text: str) -> None:
+    """把一条系统消息追加到 scrollback（仅视图层，不进对话历史）。
+
+    命令路径、会话恢复、取消提示共用同一出口，文案样式保持一致。
+    """
+    from textual.widgets import RichLog
+
+    app.query_one("#log", RichLog).write(notice_block(text))

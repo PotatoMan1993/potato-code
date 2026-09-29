@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import time
+from datetime import datetime
+from pathlib import Path
 
 from rich.console import Console
-from textual.widgets import RichLog
+from textual.widgets import RichLog, Static
 
 from potatocode.agent import ApprovalRequest, CompactEvent, CompactPhase, Event, new_runtime
+from potatocode.compact import sessions_root
 from potatocode.config import ProviderConfig
+from potatocode.llm import Message
 from potatocode.permission import Mode, Outcome, new_engine
 from potatocode.prompt import EXECUTE_DIRECTIVE
+from potatocode.session import SessionInfo, Writer
 from potatocode.tool import new_default_registry
 from potatocode.tui.app import ChatTextArea, PotatoCodeApp
 from potatocode.tui.commands import (
@@ -18,6 +25,7 @@ from potatocode.tui.commands import (
     dispatch_command,
     format_compact_notice,
 )
+from potatocode.tui.resume import ResumeSelect, build_span_reminder
 from potatocode.tui.view import SessionState, statusbar_content
 
 
@@ -205,9 +213,9 @@ async def _drain_turn(app: PotatoCodeApp, pilot) -> None:
     await pilot.pause()
 
 
-def test_command_registry_has_four_builtin_commands():
-    """I7：注册表恰好注册四项（三个迁移命令 + /compact）。"""
-    assert set(BUILTIN_COMMANDS) == {"/exit", "/plan", "/do", "/compact"}
+def test_command_registry_has_five_builtin_commands():
+    """I7：注册表恰好注册五项（三个迁移命令 + /compact + /resume）。"""
+    assert set(BUILTIN_COMMANDS) == {"/exit", "/plan", "/do", "/compact", "/resume"}
 
 
 def test_dispatch_command_routing():
@@ -409,3 +417,274 @@ async def test_tui_renders_compact_failure_event(tmp_path):
         text = _log_text(app)
 
     assert "压缩失败：摘要请求失败" in text
+
+
+# ────────── ch11：会话恢复界面 ──────────
+
+
+def _new_app_with_writer(tmp_path) -> PotatoCodeApp:
+    """建一个带会话存档的 App：存档落在 tmp_path，不污染工作目录。"""
+    engine, _ = new_engine(str(tmp_path))
+    runtime = new_runtime(workspace=str(tmp_path))
+    writer = Writer(runtime.session.session_dir, model="fake-model")
+    return PotatoCodeApp(
+        [_cfg()],
+        "dev",
+        new_default_registry(),
+        engine,
+        runtime=runtime,
+        writer=writer,
+        sessions_dir=sessions_root(str(tmp_path)),
+        workspace=str(tmp_path),
+    )
+
+
+def _seed_session(tmp_path, session_id: str, *user_texts: str) -> None:
+    """在会话根目录下造一个历史会话（每条文本一轮 user + assistant）。"""
+    path = Path(sessions_root(str(tmp_path))) / session_id
+    with Writer(str(path), model="old-model") as writer:
+        for text in user_texts:
+            writer.append(Message(role="user", content=text))
+            writer.append(Message(role="assistant", content=f"回复：{text}"))
+
+
+async def test_resume_enters_list_and_shows_items(tmp_path):
+    """`/resume` 不发 LLM，进入列表并展示每个会话的标题/时间/模型/大小（AC11/AC12）。"""
+    _seed_session(tmp_path, "20260601-100000-aaaa", "alpha project")
+    _seed_session(tmp_path, "20260602-100000-bbbb", "beta project")
+    app = _new_app_with_writer(tmp_path)
+    fake = FakeAgent()
+    async with app.run_test() as pilot:
+        app.agent = fake
+        await _submit(pilot, app, "/resume")
+        select = app.query_one(ResumeSelect)
+        prompts = [str(o.prompt) for o in select.options]
+        hint = str(app.query_one("#resume-hint", Static).content)
+        text = _log_text(app)
+
+        assert app.state is SessionState.RESUMING
+        assert fake.run_calls == 0  # 命令不发 LLM
+        assert select.total == 2
+        assert select.session_at(0).id == "20260602-100000-bbbb"  # 最新在前
+        assert "beta project" in prompts[0]
+        assert "old-model" in prompts[0]  # 模型标签
+        assert "just now" in prompts[0]  # 相对时间
+        assert "KB" in prompts[0] or "B" in prompts[0]  # 文件大小
+        assert "2/2 个会话" in hint
+        assert text  # banner 仍然在
+
+
+async def test_resume_escape_returns_to_idle(tmp_path):
+    """列表里按 Esc → 回空闲态，当前会话不变（AC11）。"""
+    _seed_session(tmp_path, "20260601-100000-aaaa", "alpha project")
+    app = _new_app_with_writer(tmp_path)
+    async with app.run_test() as pilot:
+        await _submit(pilot, app, "/resume")
+        assert app.state is SessionState.RESUMING
+        await pilot.press("escape")
+
+        assert app.state is SessionState.IDLE
+        assert app.conv.messages() == []
+
+
+async def test_resume_search_filters_list(tmp_path):
+    """输入搜索词后列表只展示标题匹配的会话（AC13）。"""
+    _seed_session(tmp_path, "20260601-100000-aaaa", "alpha project")
+    _seed_session(tmp_path, "20260602-100000-bbbb", "beta project")
+    app = _new_app_with_writer(tmp_path)
+    async with app.run_test() as pilot:
+        await _submit(pilot, app, "/resume")
+        select = app.query_one(ResumeSelect)
+        assert select.shown_count == 2
+
+        await pilot.press("a")
+        await pilot.press("l")
+        assert select.filter_text == "al"
+        assert select.shown_count == 1
+        assert select.session_at(0).id == "20260601-100000-aaaa"
+
+        await pilot.press("backspace")
+        assert select.filter_text == "a"
+        assert select.shown_count == 2  # 退一格后 "a" 同时命中 alpha 与 beta
+
+        await pilot.press("escape")
+        assert app.state is SessionState.IDLE
+
+
+async def test_resume_enter_restores_history(tmp_path):
+    """Enter 恢复：对话历史被换回，且新消息接着写进被恢复会话的存档（AC17/AC18）。"""
+    _seed_session(tmp_path, "20260601-100000-aaaa", "alpha project")
+    journal = Path(sessions_root(str(tmp_path))) / "20260601-100000-aaaa" / "conversation.jsonl"
+    before_lines = len(journal.read_text(encoding="utf-8").splitlines())
+
+    app = _new_app_with_writer(tmp_path)
+    fake = FakeAgent(events=[Event(text="接着聊。"), Event(done=True)])
+    async with app.run_test() as pilot:
+        app.agent = fake
+        await _submit(pilot, app, "/resume")
+        await pilot.press("enter")
+        await pilot.pause()
+        text = _log_text(app)
+
+        assert app.state is SessionState.IDLE
+        assert [m.content for m in app.conv.messages()] == [
+            "alpha project",
+            "回复：alpha project",
+        ]
+        assert "已恢复会话 20260601-100000-aaaa，共 2 条消息" in text
+
+        await _submit(pilot, app, "继续")
+        await _drain_turn(app, pilot)
+
+    after_lines = journal.read_text(encoding="utf-8").splitlines()
+    assert len(after_lines) > before_lines  # 新消息追加到同一个 JSONL（AC18）
+    assert any('"继续"' in line for line in after_lines)
+
+
+async def test_resume_adds_span_reminder_for_stale_session(tmp_path):
+    """最后一条消息距今超过 6 小时 → 恢复时补一条时间跨度提醒（AC17）。"""
+    session_dir = Path(sessions_root(str(tmp_path))) / "20260601-100000-aaaa"
+    session_dir.mkdir(parents=True)
+    stale = int(time.time()) - 7 * 3600
+    (session_dir / "conversation.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {"role": "user", "content": "很久以前", "ts": stale}, ensure_ascii=False
+                ),
+                json.dumps(
+                    {"role": "assistant", "content": "好的", "ts": stale}, ensure_ascii=False
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    app = _new_app_with_writer(tmp_path)
+    async with app.run_test() as pilot:
+        await _submit(pilot, app, "/resume")
+        await pilot.press("enter")
+        await pilot.pause()
+
+        msgs = app.conv.messages()
+
+    assert msgs[-1].role == "user"
+    assert "已暂停" in msgs[-1].content
+    assert "7 小时" in msgs[-1].content
+
+
+async def test_resume_skips_old_format_sessions(tmp_path):
+    """旧格式 session id 的目录不出现在列表里（AC20）。"""
+    _seed_session(tmp_path, "20260601-100000-aaaa", "alpha project")
+    legacy = Path(sessions_root(str(tmp_path))) / "1717000000-abc12345"
+    legacy.mkdir(parents=True)
+    (legacy / "conversation.jsonl").write_text(
+        '{"role":"user","content":"旧格式","ts":1}\n', encoding="utf-8"
+    )
+    app = _new_app_with_writer(tmp_path)
+    async with app.run_test() as pilot:
+        await _submit(pilot, app, "/resume")
+        select = app.query_one(ResumeSelect)
+
+    assert select.total == 1
+    assert select.session_at(0).id == "20260601-100000-aaaa"
+
+
+async def test_resume_without_history_shows_notice(tmp_path):
+    """没有任何历史会话时只提示，不进入列表状态。"""
+    app = _new_app_with_writer(tmp_path)
+    async with app.run_test() as pilot:
+        await _submit(pilot, app, "/resume")
+        text = _log_text(app)
+
+    assert app.state is SessionState.IDLE
+    assert "没有找到可恢复的历史会话" in text
+
+
+async def test_resume_blocked_while_streaming(tmp_path):
+    """Agent 运行期间输入 /resume → 只提示等待，不进入列表（AC29）。"""
+    _seed_session(tmp_path, "20260601-100000-aaaa", "alpha project")
+    app = _new_app_with_writer(tmp_path)
+    async with app.run_test() as pilot:
+        app.state = SessionState.STREAMING
+        await _submit(pilot, app, "/resume")
+        text = _log_text(app)
+
+    assert app.state is SessionState.STREAMING
+    assert "请等待当前任务完成" in text
+
+
+async def test_build_span_reminder_threshold():
+    """6 小时以内不提醒，超过才提醒（阈值边界）。"""
+    now = 1_000_000.0
+    assert build_span_reminder(0, now) == ""
+    assert build_span_reminder(int(now - 3600), now) == ""
+    reminder = build_span_reminder(int(now - 6 * 3600 - 1), now)
+    assert "已暂停" in reminder
+    assert "6 小时" in reminder
+
+
+async def test_resume_up_down_navigates(tmp_path):
+    """上下键切换高亮项（AC：上下键导航）。"""
+    _seed_session(tmp_path, "20260601-100000-aaaa", "alpha project")
+    _seed_session(tmp_path, "20260602-100000-bbbb", "beta project")
+    app = _new_app_with_writer(tmp_path)
+    async with app.run_test() as pilot:
+        await _submit(pilot, app, "/resume")
+        select = app.query_one(ResumeSelect)
+        assert select.highlighted == 0
+
+        await pilot.press("down")
+        assert select.highlighted == 1
+        assert select.session_at(select.highlighted).id == "20260601-100000-aaaa"
+
+        await pilot.press("up")
+        assert select.highlighted == 0
+
+        await pilot.press("up")  # 顶部再上移则回卷到最后一项（列表循环行为）
+        assert select.highlighted == 1
+
+
+async def test_resume_compacts_when_history_too_long(tmp_path):
+    """加载后估算 token 超阈值 → 恢复流程中先压一次再进场（AC16）。"""
+    _seed_session(tmp_path, "20260601-100000-aaaa", *[f"第{i}个很长的问题" * 20 for i in range(60)])
+    app = _new_app_with_writer(tmp_path)
+    fake = FakeAgent(before=9000, after=800)
+    async with app.run_test() as pilot:
+        app.agent = fake
+        # 选定 provider 后才有确定窗口，此处再压低：阈值 2000-20000-13000 为负 → 必然压缩
+        app.runtime.context_window = 2000
+        await _submit(pilot, app, "/resume")
+        await pilot.press("enter")
+        await pilot.pause()
+        text = _log_text(app)
+
+        assert fake.compact_calls == 1
+        assert "正在压缩" in text
+        # FakeAgent 不改历史，此处只验证「压缩被调用且恢复继续」，真实压缩由 agent 测试覆盖
+        assert app.state is SessionState.IDLE
+        assert "已恢复会话 20260601-100000-aaaa" in text
+
+
+async def test_resume_failure_keeps_current_session(tmp_path):
+    """恢复过程出错 → 提示失败并保持当前会话上下文不变（N5）。"""
+    app = _new_app_with_writer(tmp_path)
+    before_ctx = app.runtime.session
+    info = SessionInfo(
+        id="20260601-100000-aaaa",
+        title="坏会话",
+        modified_at=datetime.now(),
+        model="m",
+        size=10,
+        dir=str(tmp_path / "不存在的目录"),
+    )
+    async with app.run_test() as pilot:
+        await _submit(pilot, app, "/resume")
+        app.enter_resume_mode([info])
+        await pilot.press("enter")
+        await pilot.pause()
+        text = _log_text(app)
+
+    assert app.state is SessionState.IDLE  # 不会卡在恢复态
+    assert app.runtime.session is before_ctx  # 上下文回滚
+    assert "已恢复会话" not in text

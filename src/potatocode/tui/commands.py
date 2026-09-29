@@ -16,7 +16,8 @@ from textual.widgets import RichLog
 from ..agent import CompactEvent, CompactPhase
 from ..permission import Mode
 from ..prompt import EXECUTE_DIRECTIVE
-from .view import notice_block, user_block
+from .resume import begin_resume
+from .view import SessionState, user_block, write_notice
 
 if TYPE_CHECKING:
     from ..agent import Agent
@@ -37,11 +38,6 @@ def format_compact_notice(ev: CompactEvent) -> str:
     return f"已压缩，token 从 {ev.before} 降至 {ev.after}"
 
 
-def _write_notice(app: PotatoCodeApp, text: str) -> None:
-    """把一条系统消息写入 scrollback（仅视图层，不入对话历史）。"""
-    app.query_one("#log", RichLog).write(notice_block(text))
-
-
 async def handle_exit(app: PotatoCodeApp) -> None:
     """`/exit`：取消进行中的本轮并安全退出应用。"""
     await app.action_quit()
@@ -51,7 +47,7 @@ async def handle_plan(app: PotatoCodeApp) -> None:
     """`/plan`：切到计划模式（仅只读工具），提示用 /do 继续执行。"""
     app.mode = Mode.PLAN
     app._update_statusbar()
-    _write_notice(app, "已进入计划模式（仅只读工具；输入 /do 按计划执行）")
+    write_notice(app, "已进入计划模式（仅只读工具；输入 /do 按计划执行）")
 
 
 async def handle_do(app: PotatoCodeApp) -> None:
@@ -71,9 +67,9 @@ async def handle_compact(app: PotatoCodeApp) -> None:
     """
     agent = app.ensure_agent()
     if agent is None:
-        _write_notice(app, "尚未选定 provider，无法压缩上下文")
+        write_notice(app, "尚未选定 provider，无法压缩上下文")
         return
-    _write_notice(app, format_compact_notice(CompactEvent(phase=CompactPhase.BEFORE_AUTO)))
+    write_notice(app, format_compact_notice(CompactEvent(phase=CompactPhase.BEFORE_AUTO)))
     app.compact_task = asyncio.create_task(_run_compact(app, agent))
 
 
@@ -86,7 +82,7 @@ async def _run_compact(app: PotatoCodeApp, agent: Agent) -> None:
         before, after = await agent.run_force_compact(app.conv, app.current_defs())
     except Exception as e:
         err = e
-    _write_notice(
+    write_notice(
         app,
         format_compact_notice(
             CompactEvent(phase=CompactPhase.AFTER_AUTO, before=before, after=after, err=err)
@@ -94,18 +90,27 @@ async def _run_compact(app: PotatoCodeApp, agent: Agent) -> None:
     )
 
 
+async def handle_resume(app: PotatoCodeApp) -> None:
+    """`/resume`：进入历史会话选择列表（仅空闲态可用，F17/F46）。"""
+    if app.state is not SessionState.IDLE:
+        write_notice(app, "请等待当前任务完成")
+        return
+    await begin_resume(app)
+
+
 async def handle_unknown(app: PotatoCodeApp, input_: str = "") -> None:
     """未注册命令兜底：提示可用命令列表，不发送给 LLM。"""
     names = " ".join(BUILTIN_COMMANDS)
-    _write_notice(app, f"未知命令: {input_}，可用命令: {names}")
+    write_notice(app, f"未知命令: {input_}，可用命令: {names}")
 
 
-# 内置命令注册表：/exit /plan /do 为既有命令迁移而来，/compact 为本章新增
+# 内置命令注册表：/exit /plan /do /compact 为既有命令，/resume 为本章新增
 BUILTIN_COMMANDS: dict[str, CommandHandler] = {
     "/exit": handle_exit,
     "/plan": handle_plan,
     "/do": handle_do,
     "/compact": handle_compact,
+    "/resume": handle_resume,
 }
 
 

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from potatocode import cli
 from potatocode.agent import new_runtime
+from potatocode.compact import sessions_root
 from potatocode.config import ProviderConfig
 from potatocode.permission import new_engine
 from potatocode.tool import new_default_registry
@@ -54,10 +56,28 @@ async def test_amain_registers_mcp_tools_and_closes_manager(monkeypatch):
         return manager
 
     class FakeApp:
-        def __init__(self, providers, version, registry, engine, manager=None, runtime=None):
+        def __init__(
+            self,
+            providers,
+            version,
+            registry,
+            engine,
+            manager=None,
+            runtime=None,
+            writer=None,
+            mem_mgr=None,
+            instruction_text="",
+            memory_text="",
+            sessions_dir="",
+            workspace="",
+        ):
             observed["providers"] = providers
             observed["definitions"] = registry.definitions()
             observed["runtime"] = runtime
+            observed["writer"] = writer
+            observed["mem_mgr"] = mem_mgr
+            observed["instruction_text"] = instruction_text
+            observed["sessions_dir"] = sessions_dir
 
         async def run_async(self):
             observed["ran"] = True
@@ -77,6 +97,10 @@ async def test_amain_registers_mcp_tools_and_closes_manager(monkeypatch):
     assert observed["definitions"][-1].name == "mcp__demo__echo"
     assert observed["ran"] is True
     assert manager.closed is True
+    # ch11：启动流程把存档写入器、记忆管理器与会话目录一起交给 TUI
+    assert observed["writer"] is not None
+    assert observed["mem_mgr"] is not None
+    assert observed["sessions_dir"] == sessions_root(str(Path.cwd()))
 
 
 @pytest.mark.asyncio

@@ -33,6 +33,8 @@ from ..compact import (
 from ..conversation import Conversation
 from ..llm import (
     ROLE_ASSISTANT,
+    ROLE_USER,
+    Message,
     PromptTooLongError,
     Provider,
     Request,
@@ -42,6 +44,7 @@ from ..llm import (
     ToolResult,
 )
 from ..llm import Usage as LlmUsage
+from ..memory import Manager as MemoryManager
 from ..permission import Decision, Mode, Outcome
 from ..permission.engine import Engine
 from ..tool import DEFAULT_TIMEOUT, Registry
@@ -71,6 +74,12 @@ NOTICE_CANCELLED = "（已取消。）"
 
 # 模型回复既无文本也无工具调用时的占位最终答复（避免空 assistant 回合）
 _EMPTY_FINAL = "（本轮无回复内容。）"
+
+# 自动记忆更新的轮次间隔（ch11 F35：每 5 轮自然结束触发一次）
+MEMORY_UPDATE_INTERVAL: int = 5
+
+# 显式记忆请求关键词：命中即额外触发一次更新，保证"记住 xxx"不被间隔漏掉（F35）
+MEMORY_SIGNAL_KEYWORDS: tuple[str, ...] = ("记住", "记忆", "别忘", "remember", "memo")
 
 
 class Phase(Enum):
@@ -160,6 +169,25 @@ def _ensure_assistant_tail(conv: Conversation, fallback: str) -> None:
         conv.add_assistant(fallback)
 
 
+def recent_turn(msgs: list[Message]) -> list[Message]:
+    """截取本轮对话：从最后一条 user 消息到末尾（供记忆更新使用）。"""
+    for i in range(len(msgs) - 1, -1, -1):
+        if msgs[i].role == ROLE_USER:
+            return msgs[i:]
+    return []
+
+
+def has_memory_signal(msgs: list[Message]) -> bool:
+    """本轮用户消息是否包含显式记忆请求关键词（F35-②）。"""
+    for msg in msgs:
+        if msg.role != ROLE_USER:
+            continue
+        text = msg.content.lower()
+        if any(kw in text for kw in MEMORY_SIGNAL_KEYWORDS):
+            return True
+    return False
+
+
 def _finalized(results: list[ToolResult | None]) -> list[ToolResult]:
     """把已全填充的结果列表转为非 None 列表（执行路径保证每个下标都被填充）。"""
     out: list[ToolResult] = []
@@ -184,6 +212,9 @@ class Agent:
         version: str = "",
         *,
         runtime: SessionRuntime | None = None,
+        memory_manager: MemoryManager | None = None,
+        instruction_text: str = "",
+        memory_text: str = "",
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -193,6 +224,11 @@ class Agent:
         self.runtime = runtime if runtime is not None else new_runtime()
         # 用 asyncio.Lock 保证 run 与 run_force_compact 不并发触发上下文管理
         self._run_lock = asyncio.Lock()
+        # 项目指令与长期记忆：启动时加载一次，之后每轮请求组装时注入系统提示
+        self._mem_mgr = memory_manager
+        self._instruction_text = instruction_text
+        self._memory_text = memory_text
+        self._mem_tasks: set[asyncio.Task] = set()  # 后台记忆更新任务（持引用防被回收）
 
     async def run(
         self,
@@ -258,7 +294,7 @@ class Agent:
         """ReAct 主循环本体：每轮先管理上下文，再请求、执行工具、回灌结果。"""
         # 每次 run 起始采集环境、装配稳定系统提示（普通/规划一致；规划提醒已移出系统通道）
         env_text = prompt.gather_environment(self._version, self._provider.model).render()
-        sys = prompt.build_system_prompt()
+        sys = prompt.build_system_prompt(self._instruction_text, self._current_memory())
         if mode == Mode.PLAN:
             defs = self._registry.read_only_definitions()
         else:
@@ -387,6 +423,7 @@ class Agent:
                     final = _EMPTY_FINAL
                     yield Event(text=final)
                 conv.add_assistant(final)
+                self._maybe_update_memory(conv)  # 每 5 轮 / 显式请求时异步提炼记忆
                 yield Event(done=True)
                 return
 
@@ -694,6 +731,44 @@ class Agent:
             return
         self.runtime.recovery.record_file(abs_path, data.decode("utf-8", errors="replace"))
 
+    def _current_memory(self) -> str:
+        """取当前长期记忆索引文本。
+
+        挂了记忆管理器就现读磁盘——上一轮异步更新写完笔记后，下一轮请求立刻
+        能看到新索引（F32）；没有管理器时退回启动时注入的静态文本。
+        """
+        if self._mem_mgr is None:
+            return self._memory_text
+        try:
+            return self._mem_mgr.load_index()
+        except Exception:  # 索引读取失败降级为静态文本，不打断对话
+            logger.exception("读取记忆索引失败，沿用启动时的索引")
+            return self._memory_text
+
+    def _maybe_update_memory(self, conv: Conversation) -> None:
+        """按触发条件异步发起一次记忆更新（F35/F36）。
+
+        触发条件是「或」关系：每 5 轮到了，或本轮用户说了"记住 xxx"。
+        更新跑在独立 task 里，不阻塞用户的下一次输入（F36）。
+        """
+        self.runtime.turn_count += 1
+        mgr = self._mem_mgr
+        if mgr is None or mgr.provider is None:
+            return
+        recent = recent_turn(conv.messages())
+        if not recent:
+            return
+        due = self.runtime.turn_count % MEMORY_UPDATE_INTERVAL == 0
+        if not due and not has_memory_signal(recent):
+            return
+        try:
+            task = asyncio.create_task(mgr.update_async(recent))
+        except RuntimeError:  # 没有运行中的事件循环（同步调用场景）：跳过本次更新
+            logger.debug("无事件循环，跳过记忆更新")
+            return
+        self._mem_tasks.add(task)
+        task.add_done_callback(self._mem_tasks.discard)
+
     def _all_unknown(self, calls: list[ToolCall]) -> bool:
         """整轮调用是否全部未注册（混入任一已注册工具即视为有进展，计数重置）。"""
         return all(self._registry.get(c.name) is None for c in calls)
@@ -709,6 +784,8 @@ class Agent:
 __all__ = [
     "MAX_ITERATIONS",
     "MAX_UNKNOWN_RUN",
+    "MEMORY_SIGNAL_KEYWORDS",
+    "MEMORY_UPDATE_INTERVAL",
     "NOTICE_CANCELLED",
     "NOTICE_MAX_ITER",
     "NOTICE_STREAM_ERR",
@@ -725,5 +802,7 @@ __all__ = [
     "SessionRuntime",
     "ToolEvent",
     "Usage",
+    "has_memory_signal",
     "new_runtime",
+    "recent_turn",
 ]

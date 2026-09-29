@@ -141,3 +141,79 @@ def test_length_counts_messages():
     conv.add_user("一")
     conv.add_assistant("二")
     assert conv.length() == 2
+
+
+# ────────── 持久化回调（ch11 F44/AC28） ──────────
+
+
+def test_on_append_fires_for_every_add():
+    """四种追加各自触发一次回调，参数是刚落地的那条消息（AC28）。"""
+    seen: list[Message] = []
+    conv = Conversation(on_append=seen.append)
+
+    conv.add_user("问")
+    conv.add_assistant("答")
+    conv.add_assistant_with_tool_calls("调用", [ToolCall(id="c1", name="read_file", input="{}")])
+    conv.add_tool_results([ToolResult(tool_call_id="c1", content="结果")])
+
+    assert [m.role for m in seen] == ["user", "assistant", "assistant", "tool"]
+    assert seen[0].content == "问"
+    assert seen[2].tool_calls[0].id == "c1"
+    assert seen[3].tool_results[0].content == "结果"
+    assert len(seen) == 4
+
+
+def test_on_replace_fires_with_full_list():
+    """整体替换后回调收到替换后的完整消息列表（AC28）。"""
+    captured: list[list[Message]] = []
+    conv = Conversation(on_replace=captured.append)
+    conv.add_user("旧消息")
+
+    conv.replace_history(
+        [Message(role="user", content="摘要"), Message(role="assistant", content="继续")]
+    )
+
+    assert len(captured) == 1
+    assert [m.content for m in captured[0]] == ["摘要", "继续"]
+
+
+def test_on_replace_not_fired_when_content_unchanged():
+    """内容没变的整体替换不通知持久化层（第 1 层压缩每轮都会走到这里）。"""
+    captured: list[list[Message]] = []
+    conv = Conversation(on_replace=captured.append)
+    conv.add_user("你好")
+    conv.add_assistant("你好！")
+
+    conv.replace_history(conv.messages())  # 逐字段等价的一份新列表
+
+    assert captured == []
+    assert [m.content for m in conv.messages()] == ["你好", "你好！"]  # 历史仍然完好
+
+    conv.replace_history([Message(role="user", content="真的变了")])
+    assert len(captured) == 1
+
+
+def test_from_messages_attaches_callbacks():
+    """from_messages 构造的会话同样挂载回调（恢复场景）。"""
+    appended: list[Message] = []
+    conv = Conversation.from_messages(
+        [Message(role="user", content="历史")], on_append=appended.append
+    )
+
+    assert [m.content for m in conv.messages()] == ["历史"]
+    conv.add_user("新的一轮")
+    assert [m.content for m in appended] == ["新的一轮"]
+
+
+def test_no_callbacks_keeps_previous_behaviour():
+    """不传回调时行为与之前一致：追加、替换、深拷贝语义都不变（AC28 向后兼容）。"""
+    conv = Conversation()
+    conv.add_user("一")
+    conv.add_assistant("二")
+    assert conv.length() == 2
+
+    msgs = [Message(role="user", content="摘要")]
+    conv.replace_history(msgs)
+    msgs.append(Message(role="user", content="外部乱改"))
+
+    assert [m.content for m in conv.messages()] == ["摘要"]
