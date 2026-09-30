@@ -147,7 +147,9 @@ def list_sessions(sessions_dir: str) -> list[SessionInfo]:
                 dir=str(child.resolve()),
             )
         )
-    items.sort(key=lambda i: i.modified_at, reverse=True)
+    # 次级键用会话 id：id 前缀即创建时间戳，mtime 分辨率不足时（同秒内写入的会话）
+    # 保证「最新在前」仍然确定，而不是随扫描顺序抖动。
+    items.sort(key=lambda i: (i.modified_at, i.id), reverse=True)
     return items
 
 

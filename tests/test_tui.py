@@ -14,7 +14,7 @@ from textual.widgets import RichLog, Static
 from potatocode.agent import ApprovalRequest, CompactEvent, CompactPhase, Event, new_runtime
 from potatocode.compact import sessions_root
 from potatocode.config import ProviderConfig
-from potatocode.llm import Message
+from potatocode.llm import Message, ToolCall, ToolResult
 from potatocode.permission import Mode, Outcome, new_engine
 from potatocode.prompt import EXECUTE_DIRECTIVE
 from potatocode.session import SessionInfo, Writer
@@ -539,6 +539,80 @@ async def test_resume_enter_restores_history(tmp_path):
     after_lines = journal.read_text(encoding="utf-8").splitlines()
     assert len(after_lines) > before_lines  # 新消息追加到同一个 JSONL（AC18）
     assert any('"继续"' in line for line in after_lines)
+
+
+async def test_resume_replays_history_into_log(tmp_path):
+    """Enter 恢复：历史消息被回放到对话区，用户能直接看到内容（AC17）。"""
+    _seed_session(tmp_path, "20260601-100000-aaaa", "alpha project", "第二个问题")
+    app = _new_app_with_writer(tmp_path)
+    async with app.run_test() as pilot:
+        await _submit(pilot, app, "/resume")
+        await pilot.press("enter")
+        await pilot.pause()
+        text = _log_text(app)
+
+    assert "> alpha project" in text  # 用户块
+    assert "回复：alpha project" in text  # 助手块
+    assert "> 第二个问题" in text
+    assert "回复：第二个问题" in text
+    assert "已恢复会话 20260601-100000-aaaa，共 4 条消息" in text
+
+
+async def test_resume_replays_tool_calls_into_log(tmp_path):
+    """含工具调用的历史：工具行与结果摘要一并回放，不留白。"""
+    path = Path(sessions_root(str(tmp_path))) / "20260601-100000-aaaa"
+    with Writer(str(path), model="old-model") as writer:
+        writer.append(Message(role="user", content="读一下 README"))
+        writer.append(
+            Message(
+                role="assistant",
+                content="好的，我来看看",
+                tool_calls=[ToolCall(id="t1", name="read_file", input='{"path": "README.md"}')],
+            )
+        )
+        writer.append(
+            Message(
+                role="tool",
+                tool_results=[
+                    ToolResult(tool_call_id="t1", content="第 1 行\n第 2 行", is_error=False)
+                ],
+            )
+        )
+        writer.append(Message(role="assistant", content="读完了"))
+    app = _new_app_with_writer(tmp_path)
+    async with app.run_test() as pilot:
+        await _submit(pilot, app, "/resume")
+        await pilot.press("enter")
+        await pilot.pause()
+        text = _log_text(app)
+
+    assert "好的，我来看看" in text  # preamble
+    assert "read_file" in text and "README.md" in text  # 工具行
+    assert "第 2 行" in text  # 工具结果摘要
+    assert "读完了" in text  # 最终答复
+
+
+async def test_resume_replay_clears_previous_scrollback(tmp_path):
+    """恢复时清掉上一会话的界面残留，新旧历史不混在一起。"""
+    _seed_session(tmp_path, "20260601-100000-aaaa", "alpha project")
+    app = _new_app_with_writer(tmp_path)
+    fake = FakeAgent(events=[Event(text="旧会话的回复"), Event(done=True)])
+    async with app.run_test() as pilot:
+        app.agent = fake
+        await _submit(pilot, app, "旧会话的问题")
+        await _drain_turn(app, pilot)
+        assert "旧会话的问题" in _log_text(app)
+
+        await _submit(pilot, app, "/resume")
+        # 当前会话也在列表里且排在最前，用搜索词选中目标会话（AC13）
+        await pilot.press("a", "l", "p", "h", "a")
+        await pilot.press("enter")
+        await pilot.pause()
+        text = _log_text(app)
+
+    assert "alpha project" in text
+    assert "旧会话的问题" not in text
+    assert "旧会话的回复" not in text
 
 
 async def test_resume_adds_span_reminder_for_stale_session(tmp_path):

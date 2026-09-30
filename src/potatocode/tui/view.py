@@ -10,10 +10,14 @@ from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
 
+from ..llm import ROLE_ASSISTANT, ROLE_TOOL, ROLE_USER, Message
 from ..permission import Mode
 
 # 结果摘要在界面上的行数上限（N5：与回灌给模型的截断相互独立）
 _RESULT_SUMMARY_LINES = 8
+
+# 回放历史时工具调用参数的展示宽度上限（超长参数压成一行并截断）
+_TOOL_ARGS_WIDTH = 80
 
 
 class SessionState(Enum):
@@ -158,6 +162,37 @@ def notice_block(text: str) -> RenderableType:
         Text(""),
         Text(text, style="dim italic"),
     )
+
+
+def format_tool_args(raw: str) -> str:
+    """把工具调用的原始参数压成一行并限宽（回放历史用，避免长参数撑爆 scrollback）。"""
+    flat = " ".join(raw.split())
+    if len(flat) <= _TOOL_ARGS_WIDTH:
+        return flat
+    return flat[: _TOOL_ARGS_WIDTH - 1] + "…"
+
+
+def history_blocks(msgs: list[Message]) -> list[RenderableType]:
+    """把恢复出来的历史消息渲染成回放块（/resume 进场时重绘对话区）。
+
+    与实时渲染（stream.py）保持同一视觉语言：用户块、助手正文、工具行 + 结果摘要。
+    助手回合在历史中以「preamble（带 tool_calls）」与「最终答复」两种形态出现，
+    这里如实回放：带工具调用的回合只出正文 + 工具行，不带耗时行（耗时是实时信息，
+    历史存档里没有）。
+    """
+    blocks: list[RenderableType] = []
+    for msg in msgs:
+        if msg.role == ROLE_USER:
+            blocks.append(user_block(msg.content))
+        elif msg.role == ROLE_ASSISTANT:
+            if msg.content.strip():
+                blocks.append(preamble_block(msg.content))
+            for call in msg.tool_calls:
+                blocks.append(tool_line(call.name, format_tool_args(str(call.input))))
+        elif msg.role == ROLE_TOOL:
+            for result in msg.tool_results:
+                blocks.append(tool_result_summary(result.content, result.is_error))
+    return blocks
 
 
 def write_notice(app, text: str) -> None:

@@ -14,14 +14,14 @@ import time
 from typing import TYPE_CHECKING
 
 from textual import events
-from textual.widgets import OptionList
+from textual.widgets import OptionList, RichLog
 from textual.widgets.option_list import Option
 
 from ..compact import AUTO_SAFETY_MARGIN, SUMMARY_RESERVE, estimate_tokens, open_session_context
 from ..conversation import Conversation
 from ..llm import ROLE_USER, Message
 from ..session import SessionInfo, Writer, list_sessions, load_session_full
-from .view import write_notice
+from .view import history_blocks, write_notice
 
 if TYPE_CHECKING:
     from .app import PotatoCodeApp
@@ -167,14 +167,17 @@ async def begin_resume(app: PotatoCodeApp) -> None:
 
 
 async def do_resume_session(app: PotatoCodeApp, info: SessionInfo) -> None:
-    """恢复指定会话：换上下文 → 必要时压缩 → 时间跨度提醒 → 换存档与历史。"""
-    write_notice(app, f"正在恢复会话 {info.id} ...")
+    """恢复指定会话：换上下文 → 必要时压缩 → 时间跨度提醒 → 换存档与历史 → 重绘对话区。"""
     loaded = load_session_full(info.dir)
     msgs: list[Message] = list(loaded.messages)
     if not msgs:
         # 存档被删/全坏行：不切过去，免得把用户丢进一个空会话（N5）
         write_notice(app, f"会话 {info.id} 没有可恢复的消息，已保持当前会话")
         return
+
+    # 确认有内容可恢复才开始：清掉上一会话的 scrollback，后续进度提示与回放按序累积
+    _clear_log(app)
+    write_notice(app, f"正在恢复会话 {info.id} ...")
 
     old_ctx = app.runtime.session
     try:
@@ -187,6 +190,8 @@ async def do_resume_session(app: PotatoCodeApp, info: SessionInfo) -> None:
         write_notice(app, f"恢复会话失败：{type(e).__name__}: {e}")
         return
 
+    # 提醒块是系统注入的，视图层用 notice 样式展示，不混进用户消息的回放
+    replay = list(msgs)
     reminder = build_span_reminder(loaded.last_ts)
     if reminder:
         msgs = [*msgs, Message(role=ROLE_USER, content=reminder)]
@@ -204,7 +209,29 @@ async def do_resume_session(app: PotatoCodeApp, info: SessionInfo) -> None:
     app.runtime.usage_anchor = 0
     app.runtime.anchor_msg_len = 0
 
+    # 对话区重绘：把恢复出的历史按原样回放，用户一眼能看到消息内容（F21）
+    _replay_history(app, replay)
+    if reminder:
+        write_notice(app, reminder)
     write_notice(app, f"已恢复会话 {info.id}，共 {len(msgs)} 条消息")
+
+
+def _clear_log(app: PotatoCodeApp) -> None:
+    """清空对话区 scrollback（换会话前丢弃上一会话的界面残留）。"""
+    try:
+        app.query_one("#log", RichLog).clear()
+    except Exception:  # 纯视图操作：失败不阻断恢复流程（N5）
+        logger.exception("清空对话区失败")
+
+
+def _replay_history(app: PotatoCodeApp, msgs: list[Message]) -> None:
+    """把历史消息按序回放到对话区（失败只记日志，不影响已完成的恢复，N5）。"""
+    try:
+        log = app.query_one("#log", RichLog)
+        for block in history_blocks(msgs):
+            log.write(block)
+    except Exception:  # 纯视图操作：失败不回滚会话，只损失一次回放
+        logger.exception("恢复会话的历史回放失败")
 
 
 async def _compact_if_needed(app: PotatoCodeApp, msgs: list[Message]) -> list[Message]:
