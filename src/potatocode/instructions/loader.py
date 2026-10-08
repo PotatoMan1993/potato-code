@@ -73,10 +73,10 @@ class Loader:
         root = os.path.realpath(self.project_root) if self.project_root else os.getcwd()
         potatocode_dir = os.path.join(root, ".potatocode")
         return [
-            (os.path.join(root, "MEWCODE.md"), root),
-            (os.path.join(potatocode_dir, "MEWCODE.md"), root),
+            (os.path.join(root, "POTATOCODE.md"), root),
+            (os.path.join(potatocode_dir, "POTATOCODE.md"), root),
             (
-                os.path.join(self.user_home, ".potatocode", "MEWCODE.md"),
+                os.path.join(self.user_home, ".potatocode", "POTATOCODE.md"),
                 os.path.join(self.user_home, ".potatocode"),
             ),
         ]
