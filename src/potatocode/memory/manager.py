@@ -113,6 +113,7 @@ class Manager:
         if not actions:
             logger.debug("本次记忆更新无操作")
             return
+        logger.debug(f"模型输出的记忆更新操作：{actions}")
         project = [a for a in actions if a.level == LEVEL_PROJECT]
         user = [a for a in actions if a.level == LEVEL_USER]
         self._project.apply(project)

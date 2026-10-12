@@ -14,7 +14,7 @@ PACKAGE_LOGGER = "potatocode"
 # 详细度环境变量名，取值是标准库级别名（大小写不敏感）
 LEVEL_ENV = "POTATOCODE_LOG_LEVEL"
 # 默认详细度：信息级。更详细的调试级需显式开启
-DEFAULT_LEVEL = "INFO"
+DEFAULT_LEVEL = "DEBUG"
 # 四要素格式：时间、级别、来源模块与行号、消息
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s:%(lineno)d — %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"

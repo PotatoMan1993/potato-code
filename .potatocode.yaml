@@ -22,4 +22,5 @@ mcp_servers:
     command: npx
     args: ["-y", "@upstash/context7-mcp"]
     env:
-      CONTEXT7_API_KEY: "${CONTEXT7_API_KEY}"
+      # CONTEXT7_API_KEY: "${CONTEXT7_API_KEY}"
+      CONTEXT7_API_KEY: "ctx7sk-b7e0f91c-7b69-45b6-aa1e-1b3db44951f0"
