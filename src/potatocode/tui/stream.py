@@ -18,13 +18,13 @@ from textual.widgets import RichLog, Static
 from ..agent import NOTICE_CANCELLED, Agent, ApprovalRequest, Mode, Phase, ToolEvent
 from ..permission import outcome_for_index
 from ..permission.engine import Engine
-from .commands import format_compact_notice
 from .view import (
     SessionState,
     ToolDisplay,
     approval_block,
     assistant_block,
     error_block,
+    format_compact_notice,
     notice_block,
     preamble_block,
     tool_line,

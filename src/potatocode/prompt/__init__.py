@@ -42,15 +42,17 @@ BANNER: str = r"""
 
 
 def render_banner(version: str, cwd: str) -> str:
-    """拼装启动横幅：ASCII 图案 + 应用名与版本号 + 当前工作目录 + 就绪提示行。"""
+    """拼装启动横幅：ASCII 图案 + 应用名与版本号 + 当前工作目录 + 就绪提示行。
+
+    就绪提示只引导 /help（N7：命令清单由注册中心统一供给，banner 不再硬编码）。
+    """
     return (
         f"{BANNER.rstrip()}\n"
         f"\n"
         f"  PotatoCode v{version}\n"
         f"  cwd: {cwd}\n"
         f"\n"
-        f"  Ready. 输入消息开始对话（Enter 发送 · Alt+Enter 换行 · "
-        f"/plan 计划模式 · /do 执行 · /exit 退出）\n"
+        f"  Ready. 输入消息开始对话（Enter 发送 · Alt+Enter 换行 · 输入 /help 查看可用命令）\n"
     )
 
 

@@ -1354,8 +1354,8 @@ async def test_instruction_and_memory_injected_into_system_prompt(tmp_path):
     assert stable.index("你是 PotatoCode") < stable.index("项目规范")
 
 
-async def test_memory_index_reread_from_manager(tmp_path):
-    """挂了记忆管理器时每轮现读索引（上一轮写下的笔记下一轮即可见，F32）。"""
+async def test_memory_text_injected_once_at_startup(tmp_path):
+    """系统提示的长期记忆取启动时注入的静态文本，运行中不再现读管理器索引。"""
 
     class LiveManager(FakeMemoryManager):
         def __init__(self) -> None:
@@ -1373,17 +1373,20 @@ async def test_memory_index_reread_from_manager(tmp_path):
         _engine(str(tmp_path)),
         runtime=new_runtime(workspace=str(tmp_path)),
         memory_manager=mgr,
+        memory_text="- [user_preference] 启动时的偏好",
     )
     conv = Conversation()
     conv.add_user("第一轮")
     await _collect(agent, conv)
-    assert "第一轮记下的偏好" not in provider.systems_seen[0].stable
+    assert "启动时的偏好" in provider.systems_seen[0].stable
 
-    mgr.index = "- [user_preference] 第一轮记下的偏好"
+    mgr.index = "- [user_preference] 运行中写下的偏好"
     conv.add_user("第二轮")
     await _collect(agent, conv)
 
-    assert "第一轮记下的偏好" in provider.systems_seen[1].stable
+    # 运行中不现读索引：两轮系统提示逐字节一致（长期记忆仅启动时读取一次）
+    assert provider.systems_seen[1].stable == provider.systems_seen[0].stable
+    assert "运行中写下的偏好" not in provider.systems_seen[1].stable
 
 
 async def test_memory_update_triggered_every_five_turns(tmp_path):

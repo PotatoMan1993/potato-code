@@ -31,6 +31,21 @@ class SessionRuntime:
     turn_count: int = 0  # 已自然完成的对话轮数（ch11：每 5 轮触发一次记忆更新）
     # 字段读写都在 asyncio 单线程事件循环内完成，无需额外加锁
 
+    def reset_for_new_session(self, ses_ctx: SessionContext) -> None:
+        """/clear 开新会话时原子重置（ch12 T0c）。
+
+        compact 三个子状态全部换新实例，用量锚点与轮数清零，会话指向新的
+        `ses_ctx`；`context_window` 跟随 provider 保留，writer 与 conv 的重建由
+        调用方负责，不进本接口。
+        """
+        self.replacement = ContentReplacementState()
+        self.recovery = RecoveryState()
+        self.auto_tracking = CompactCircuitBreaker()
+        self.session = ses_ctx
+        self.usage_anchor = 0
+        self.anchor_msg_len = 0
+        self.turn_count = 0
+
 
 def new_runtime(
     workspace: str = ".",

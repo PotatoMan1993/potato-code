@@ -20,13 +20,8 @@ from potatocode.prompt import EXECUTE_DIRECTIVE
 from potatocode.session import SessionInfo, Writer
 from potatocode.tool import new_default_registry
 from potatocode.tui.app import ChatTextArea, PotatoCodeApp
-from potatocode.tui.commands import (
-    BUILTIN_COMMANDS,
-    dispatch_command,
-    format_compact_notice,
-)
 from potatocode.tui.resume import ResumeSelect, build_span_reminder
-from potatocode.tui.view import SessionState, statusbar_content
+from potatocode.tui.view import SessionState, format_compact_notice, statusbar_content
 
 
 def _cfg() -> ProviderConfig:
@@ -158,7 +153,7 @@ async def test_approval_escape_cancels(tmp_path):
         assert app.state is SessionState.STREAMING
 
 
-# ────────── ch08：命令分发与压缩状态提示 ──────────
+# ────────── ch12：命令分发（dispatch_slash） ──────────
 
 
 class FakeAgent:
@@ -211,21 +206,6 @@ async def _drain_turn(app: PotatoCodeApp, pilot) -> None:
     if task is not None:
         await task
     await pilot.pause()
-
-
-def test_command_registry_has_five_builtin_commands():
-    """I7：注册表恰好注册五项（三个迁移命令 + /compact + /resume）。"""
-    assert set(BUILTIN_COMMANDS) == {"/exit", "/plan", "/do", "/compact", "/resume"}
-
-
-def test_dispatch_command_routing():
-    """I7：非命令走对话路径；已注册命令返回处理器；未注册命令走兜底处理器。"""
-    assert dispatch_command("你好") == (None, False)
-    handler, is_command = dispatch_command("/compact")
-    assert is_command is True and handler is BUILTIN_COMMANDS["/compact"]
-
-    unknown, is_command = dispatch_command("/unknown")
-    assert is_command is True and unknown is not None
 
 
 def test_format_compact_notice_phases():
@@ -289,22 +269,95 @@ async def test_tui_compact_failure_message(tmp_path):
 
 
 async def test_tui_unknown_slash_command_friendly(tmp_path):
-    """C14/I7：未注册命令给出友好提示，且不发 LLM。"""
+    """C14/G1：未注册命令给出 /help 引导提示，且不发 LLM（F6/AC2）。"""
     app = _new_app(tmp_path)
     fake = FakeAgent()
     async with app.run_test() as pilot:
         app.agent = fake
-        await _submit(pilot, app, "/unknown")
+        await _submit(pilot, app, "/foobar")
         text = _log_text(app)
 
-    assert "未知命令: /unknown" in text
-    assert "/compact" in text  # 提示里列出可用命令
+    assert "未知命令" in text
+    assert "/help" in text  # 引导使用 /help（单一信源，不再硬编码命令清单）
     assert fake.run_calls == 0
     assert app.conv.messages() == []
 
 
+async def test_tui_dispatch_case_insensitive(tmp_path):
+    """`/Help` 与 `/help` 行为一致（F4/AC3）。"""
+    app = _new_app(tmp_path)
+    async with app.run_test() as pilot:
+        await _submit(pilot, app, "/Help")
+        text = _log_text(app)
+
+    for name in ("clear", "compact", "do", "exit", "help", "memory"):
+        assert f"/{name}" in text
+    assert app.conv.messages() == []
+
+
+async def test_tui_dispatch_help_lists_all_builtins(tmp_path):
+    """/help 输出全部 12 条命令名与描述（F18/AC1）。"""
+    app = _new_app(tmp_path)
+    fake = FakeAgent()
+    async with app.run_test() as pilot:
+        app.agent = fake
+        await _submit(pilot, app, "/help")
+        text = _log_text(app)
+
+    for name in (
+        "clear",
+        "compact",
+        "do",
+        "exit",
+        "help",
+        "memory",
+        "permission",
+        "plan",
+        "resume",
+        "review",
+        "session",
+        "status",
+    ):
+        assert f"/{name}" in text
+    assert fake.run_calls == 0
+    assert app.conv.messages() == []
+
+
+async def test_tui_dispatch_busy_blocks_ui_command(tmp_path):
+    """流式期间提交 UI 类命令 → 明确提示等待，不执行（N3a）。"""
+    app = _new_app(tmp_path)
+    async with app.run_test() as pilot:
+        app.state = SessionState.STREAMING
+        await _submit(pilot, app, "/plan")
+        text = _log_text(app)
+
+    assert app.mode is Mode.DEFAULT  # 模式未被切换
+    assert "请等待当前任务完成" in text
+    assert app.conv.messages() == []
+
+
+async def test_tui_dispatch_handler_error_shows_error_block(tmp_path):
+    """handler 抛异常时用户看到错误块，程序不退出（G3 决策表）。"""
+    from potatocode.command import Command, Kind
+
+    app = _new_app(tmp_path)
+
+    async def _boom(ui) -> None:
+        raise RuntimeError("炸了")
+
+    app.cmd_registry.register(
+        Command(name="boom", description="测试异常", kind=Kind.LOCAL, handler=_boom)
+    )
+    async with app.run_test() as pilot:
+        await _submit(pilot, app, "/boom")
+        text = _log_text(app)
+
+    assert "✗" in text
+    assert "炸了" in text
+
+
 async def test_tui_migrated_exit_still_works(tmp_path):
-    """I7：迁移后 /exit 仍然退出（走命令路径，不开新一轮）。"""
+    """I7/AC10：迁移后 /exit 仍然退出（走命令路径，不开新一轮）。"""
     app = _new_app(tmp_path)
     fake = FakeAgent()
     quit_calls: list[bool] = []
@@ -316,14 +369,15 @@ async def test_tui_migrated_exit_still_works(tmp_path):
     async with app.run_test() as pilot:
         app.agent = fake
         await _submit(pilot, app, "/exit")
+        await pilot.pause()
 
     assert quit_calls == [True]
     assert fake.run_calls == 0
     assert app.conv.messages() == []
 
 
-async def test_tui_migrated_plan_still_works(tmp_path):
-    """I7：迁移后 /plan 仍然切到计划模式并给提示，不发请求。"""
+async def test_tui_dispatch_plan_local_only(tmp_path):
+    """I7/F10：迁移后 /plan 仍切到计划模式，不写历史、不发请求（AC10）。"""
     app = _new_app(tmp_path)
     fake = FakeAgent()
     async with app.run_test() as pilot:
@@ -332,13 +386,13 @@ async def test_tui_migrated_plan_still_works(tmp_path):
         text = _log_text(app)
 
     assert app.mode is Mode.PLAN
-    assert "已进入计划模式" in text
+    assert "已切换到 PLAN 模式" in text
     assert fake.run_calls == 0
     assert app.conv.messages() == []
 
 
-async def test_tui_migrated_do_still_works(tmp_path):
-    """I7：迁移后 /do 仍切回 default、注入执行指令并启动一轮。"""
+async def test_tui_dispatch_do_injects_and_sends(tmp_path):
+    """I7/F11/N3：迁移后 /do 仍切回 default、注入执行指令并立即触发一轮。"""
     app = _new_app(tmp_path)
     fake = FakeAgent(events=[Event(text="按计划开跑。"), Event(done=True)])
     async with app.run_test() as pilot:

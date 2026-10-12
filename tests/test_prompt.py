@@ -12,6 +12,7 @@ from potatocode.prompt import (
     gather_environment,
     optional_modules,
     plan_reminder,
+    render_banner,
     system_reminder,
 )
 from potatocode.prompt.modules import Module
@@ -194,3 +195,26 @@ def test_build_system_prompt_skips_empty_slot():
     assert "记忆内容" in only_memory
     assert "\n\n\n" not in only_memory
     assert build_system_prompt("", "") != only_memory
+
+
+# ────────── 启动横幅引导（ch12 N7） ──────────
+
+
+def test_banner_hints_only_help():
+    """banner 的就绪提示只引导 /help，不硬编码其余命令名（N7：清单由注册中心供给）。"""
+    text = render_banner("9.9.9", "/work/dir")
+    assert "/help" in text
+    for name in (
+        "clear",
+        "compact",
+        "do",
+        "exit",
+        "memory",
+        "permission",
+        "plan",
+        "resume",
+        "review",
+        "session",
+        "status",
+    ):
+        assert f"/{name}" not in text

@@ -420,3 +420,35 @@ def test_memory_dirs():
     assert proj.endswith("/tmp/proj/.potatocode/memory")
     assert user_memory_dir("/tmp/home").replace("\\", "/").endswith("/tmp/home/.potatocode/memory")
     assert Path(user_memory_dir("/tmp/home")).name == "memory"
+
+
+# ────────── 文件名清单（ch12 T0a：/memory 数据源） ──────────
+
+
+def test_list_files_missing_dirs(tmp_path):
+    """两级目录都不存在时返回两个空列表，不抛异常。"""
+    mgr = Manager(str(tmp_path / "no-proj"), str(tmp_path / "no-user"))
+    assert mgr.list_files() == ([], [])
+
+
+def test_list_files_only_index(tmp_path):
+    """仅含 MEMORY.md 时各返回一条（含索引自身，ch12 F20）。"""
+    proj, user = tmp_path / "proj", tmp_path / "user"
+    proj.mkdir()
+    user.mkdir()
+    (proj / "MEMORY.md").write_text("", encoding="utf-8")
+    (user / "MEMORY.md").write_text("", encoding="utf-8")
+    mgr = Manager(str(proj), str(user))
+    assert mgr.list_files() == (["MEMORY.md"], ["MEMORY.md"])
+
+
+def test_list_files_sorted_and_md_only(tmp_path):
+    """多 .md 按字典序排序；非 .md 文件不出现。"""
+    proj, user = tmp_path / "proj", tmp_path / "user"
+    proj.mkdir()
+    user.mkdir()
+    for name in ("b_note.md", "a_note.md", "ignore.txt", "c.md"):
+        (proj / name).write_text("", encoding="utf-8")
+    (user / "u_note.md").write_text("", encoding="utf-8")
+    mgr = Manager(str(proj), str(user))
+    assert mgr.list_files() == (["a_note.md", "b_note.md", "c.md"], ["u_note.md"])

@@ -91,6 +91,10 @@ class Registry:
         """按名查找工具，未命中返回 None。"""
         return self._tools.get(name)
 
+    def count(self) -> int:
+        """当前已注册工具数量（O(1)，/status 查询用，ch12 T0c）。"""
+        return len(self._tools)
+
     def definitions(self) -> list[ToolDefinition]:
         """按注册顺序导出协议无关工具定义（F3/AC1）。"""
         return [

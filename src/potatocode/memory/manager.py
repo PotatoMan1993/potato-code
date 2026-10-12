@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 
 from ..llm import Message, Provider, Request, System
 from .const import LEVEL_PROJECT, LEVEL_USER, MAX_INDEX_BYTES, TRUNCATED_MARK
@@ -61,6 +62,24 @@ class Manager:
         """选定 provider 后延迟注入（启动时 provider 尚未确定）。"""
         self._provider = provider
         self._model = model
+
+    def list_files(self) -> tuple[list[str], list[str]]:
+        """列出两级 memory 目录下的 .md 文件名（含 MEMORY.md），各自按字典序排序（ch12 T0a）。
+
+        目录不存在视为空列表；其它 OSError 记 warning 后同样视为空，绝不影响主会话。
+        """
+        return self._list_level_files(self._project), self._list_level_files(self._user)
+
+    def _list_level_files(self, store: Store) -> list[str]:
+        """单级 memory 目录下的 .md 文件名（排序后返回）。"""
+        try:
+            names = [name for name in os.listdir(store.dir) if name.endswith(".md")]
+        except FileNotFoundError:
+            return []  # 目录尚未创建：正常情况（首次使用）
+        except OSError as e:
+            logger.warning("列出记忆文件失败: %s", e)
+            return []
+        return sorted(names)
 
     def load_index(self) -> str:
         """拼接两级索引（项目级在前、用户级在后），超过 25KB 截断并标注（F32/F34）。"""

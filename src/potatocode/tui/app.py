@@ -18,6 +18,8 @@ from textual.widgets import RichLog, Static, TextArea
 
 from ..agent import Agent, ApprovalRequest
 from ..agent.runtime import SessionRuntime, new_runtime
+from ..command import Registry as CommandRegistry
+from ..command import register_builtins
 from ..compact import sessions_root
 from ..config import ProviderConfig, effective_context_window
 from ..conversation import Conversation
@@ -29,7 +31,8 @@ from ..permission.engine import Engine
 from ..prompt import render_banner
 from ..session import SessionInfo, Writer
 from ..tool import Registry
-from .commands import dispatch_command
+from .commands import CommandMixin
+from .complete import CompletionMenu, CompletionMixin
 from .resume import ResumeSelect, do_resume_session
 from .select import ProviderSelect
 from .stream import StreamMixin
@@ -39,7 +42,6 @@ from .view import (
     notice_block,
     statusbar_content,
     user_block,
-    write_notice,
 )
 
 logger = logging.getLogger(__name__)
@@ -79,6 +81,11 @@ class ChatTextArea(TextArea):
                 event.stop()
                 event.prevent_default()
                 return
+            if app.completion.active and app.handle_completion_key(event.key):
+                # 补全菜单激活：↑↓/Tab/回车/ESC 由菜单消费（ch12 F29-F32）
+                event.stop()
+                event.prevent_default()
+                return
             if event.key == "shift+tab" and app.state is SessionState.IDLE:
                 event.stop()
                 event.prevent_default()
@@ -105,7 +112,7 @@ class ChatTextArea(TextArea):
         app.action_cancel_or_quit()
 
 
-class PotatoCodeApp(StreamMixin, App):
+class PotatoCodeApp(CompletionMixin, CommandMixin, StreamMixin, App):
     """PotatoCode 主应用。
 
     完成的消息（用户输入 / 助手回复 / 错误 / banner）持久追加到 RichLog，
@@ -154,6 +161,13 @@ class PotatoCodeApp(StreamMixin, App):
         height: auto;
         max-height: 10;
         width: 1fr;
+    }
+    #completion {
+        height: auto;
+        max-height: 12;
+        padding: 0 2;
+        width: 1fr;
+        display: none;
     }
     #select-screen {
         height: auto;
@@ -220,6 +234,11 @@ class PotatoCodeApp(StreamMixin, App):
         self._version = version
         # 注意：不能用 `_registry`——Textual App 内部已占用该名字（AppRegistry）
         self._tool_registry = registry
+        # 斜杠命令注册中心：与工具注册中心相互独立（ch12 G1/G4）
+        cmd_reg = CommandRegistry()
+        register_builtins(cmd_reg)  # 名字/别名冲突在启动期立即抛错（F2）
+        self.cmd_registry: CommandRegistry = cmd_reg
+        self.completion = CompletionMenu()
         self.engine = engine  # 权限引擎（前四层），模式切换只影响后续兜底裁决
         self.manager = manager  # mcp manager
         self.provider: Provider | None = None
@@ -262,6 +281,7 @@ class PotatoCodeApp(StreamMixin, App):
                     placeholder="Send a message...",
                     soft_wrap=True,
                 )
+            yield Static(id="completion")
         with Vertical(id="select-screen"):
             yield Static("选择一个 provider：", id="select-title")
             yield ProviderSelect(self.providers, id="select")
@@ -434,29 +454,18 @@ class PotatoCodeApp(StreamMixin, App):
         self._activate_provider(cfg)
 
     async def on_chat_submitted(self, event: ChatSubmitted) -> None:
-        """处理输入框提交：斜杠输入走命令分发，其余作为用户消息发起一轮对话。"""
+        """处理输入框提交：斜杠输入走命令分发，其余作为用户消息发起一轮对话（ch12 F3）。"""
         text = event.text.strip()
         input_box = self.query_one(ChatTextArea)
+        # 任何提交都先关闭补全菜单（F30/F32）
+        self.completion.hide()
+        self._refresh_completion()
         if not text:
             input_box.clear()
             return
 
-        handler, is_command = dispatch_command(text)
-        if is_command:
-            assert handler is not None  # 约定：is_command 为真时必返回处理器
-            if text == "/resume" and self.state in (
-                SessionState.STREAMING,
-                SessionState.APPROVING,
-            ):
-                # 运行中不允许恢复（F46/AC29）：明确回话而不是静默吞掉
-                input_box.clear()
-                write_notice(self, "请等待当前任务完成")
-                return
-            if text != "/exit" and (self.state is not SessionState.IDLE or self.provider is None):
-                # 流式期间 / 未选定 provider：除退出外不接受命令（保留已输入内容）
-                return
+        if await self.dispatch_slash(text):
             input_box.clear()
-            await handler(self)
             return
 
         if self.state is not SessionState.IDLE or self.provider is None:
@@ -467,6 +476,11 @@ class PotatoCodeApp(StreamMixin, App):
         self.conv.add_user(text)
         self.query_one("#log", RichLog).write(user_block(text))
         self._start_turn()
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        """输入框内容变化 → 同步补全菜单（ch12 F24/F26/F32a）。"""
+        if event.text_area.id == "input":
+            self._sync_completion_from_input()
 
     def _start_turn(self) -> None:
         """启动一轮 Agent Loop：建取消事件、起消费 task、进 STREAMING 态。"""

@@ -10,6 +10,7 @@ from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
 
+from ..agent import CompactEvent, CompactPhase
 from ..llm import ROLE_ASSISTANT, ROLE_TOOL, ROLE_USER, Message
 from ..permission import Mode
 
@@ -162,6 +163,25 @@ def notice_block(text: str) -> RenderableType:
         Text(""),
         Text(text, style="dim italic"),
     )
+
+
+def error_notice_block(msg: str) -> RenderableType:
+    """错误提示块（红色）：命令路径的可读失败信息，仅展示不入历史。"""
+    return Group(
+        Text(""),
+        Text(f"✗ {msg}", style="bold red"),
+    )
+
+
+def format_compact_notice(ev: CompactEvent) -> str:
+    """把压缩事件渲染成系统消息文案（自动 / 紧急 / 手动三条路径共用同一格式）。"""
+    if ev.phase is CompactPhase.BEFORE_AUTO:
+        return "正在压缩上下文..."
+    if ev.phase is CompactPhase.BEFORE_EMERGENCY:
+        return "上下文撞墙，自动压缩中..."
+    if ev.err is not None:
+        return f"压缩失败：{ev.err}"
+    return f"已压缩，token 从 {ev.before} 降至 {ev.after}"
 
 
 def format_tool_args(raw: str) -> str:

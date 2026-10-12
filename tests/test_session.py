@@ -359,3 +359,14 @@ def test_clean_expired_skips_plain_files(tmp_path):
 
     assert clean_expired(str(sessions_root)) == 0
     assert stray.exists()
+
+
+# ────────── 存档路径（ch12 T0b：/session 数据源） ──────────
+
+
+def test_writer_path_property(tmp_path):
+    """writer.path 指向会话目录下的 conversation.jsonl 且文件已创建。"""
+    d = _session_dir(tmp_path)
+    with Writer(str(d), model="m") as writer:
+        assert writer.path.endswith("conversation.jsonl")
+        assert Path(writer.path).exists()
