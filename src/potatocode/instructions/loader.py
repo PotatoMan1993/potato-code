@@ -1,10 +1,10 @@
-"""项目指令加载器：三层 MEWCODE.md 合并 + `@include` 展开。
+"""项目指令加载器：三层 POTATOCODE.md 合并 + `@include` 展开。
 
 三层优先级（高在前，模型优先遵循）：
 
-1. `<project_root>/MEWCODE.md` —— 项目级
-2. `<project_root>/.potatocode/MEWCODE.md` —— 项目配置级
-3. `~/.potatocode/MEWCODE.md` —— 用户级
+1. `<project_root>/POTATOCODE.md` —— 项目级
+2. `<project_root>/.potatocode/POTATOCODE.md` —— 项目配置级
+3. `~/.potatocode/POTATOCODE.md` —— 用户级
 
 每一层缺失、读不了、是二进制都只跳过该层，绝不阻断启动（N5）；层与层之间用空行
 分隔。`@include` 支持嵌套（限 5 层）、环路检测与路径逃逸检测，三种异常都保留原
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # 独占一行的 @include 引用：`@include <相对路径>`
 INCLUDE_PATTERN = re.compile(r"^@include[ \t]+(.+?)\s*$")
 
-# 嵌套深度上限：MEWCODE.md 本身算第 1 层
+# 嵌套深度上限：POTATOCODE.md 本身算第 1 层
 MAX_DEPTH = 5
 
 # 二进制探测窗口（前 512 字节出现 NUL 即视为不可读）
@@ -53,9 +53,9 @@ def _within(path: str, boundary: str) -> bool:
 
 @dataclass
 class Loader:
-    """三层 MEWCODE.md 的加载与 @include 展开。
+    """三层 POTATOCODE.md 的加载与 @include 展开。
 
-    `max_depth` 从 1 起算：顶层 MEWCODE.md 是第 1 层，被它 include 的文件是第 2 层。
+    `max_depth` 从 1 起算：顶层 POTATOCODE.md 是第 1 层，被它 include 的文件是第 2 层。
     """
 
     project_root: str

@@ -294,7 +294,7 @@ class Agent:
         """ReAct 主循环本体：每轮先管理上下文，再请求、执行工具、回灌结果。"""
         # 每次 run 起始采集环境、装配稳定系统提示（普通/规划一致；规划提醒已移出系统通道）
         env_text = prompt.gather_environment(self._version, self._provider.model).render()
-        sys = prompt.build_system_prompt(self._instruction_text, self._current_memory())
+        sys = prompt.build_system_prompt(self._instruction_text, self._memory_text)
         if mode == Mode.PLAN:
             defs = self._registry.read_only_definitions()
         else:
