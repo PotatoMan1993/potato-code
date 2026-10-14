@@ -13,11 +13,15 @@ from pathlib import Path
 
 from . import __version__, config, instructions, mcp, memory, permission, session
 from .agent import new_runtime
+from .command.skill_register import build_skill_catalog_text
 from .compact import SessionContext, new_session_context, sessions_root
 from .config import ConfigError
 from .logging_setup import close_logging, setup_logging
 from .memory import project_memory_dir, user_memory_dir
+from .skills import SkillExecutor, SkillLoader
 from .tool import new_default_registry
+from .tool.install_skill import InstallSkillTool
+from .tool.load_skill import LoadSkill
 from .tui import PotatoCodeApp
 
 logger = logging.getLogger(__name__)
@@ -74,6 +78,18 @@ async def _run(root: str, ses_ctx: SessionContext) -> int:
     cleanup.add_done_callback(_log_cleanup)
 
     registry = new_default_registry()
+    # ch13 Skill 系统：先扫描两级 skill 目录，再把 LoadSkill / InstallSkill 注册为
+    # 内置工具（在 Agent 构造前进注册中心，保证首轮请求就能看到 LoadSkill 定义）
+    skill_loader = SkillLoader(root)
+    skill_loader.load_all()
+    load_skill_tool = LoadSkill()
+    load_skill_tool.set_loader(skill_loader)
+    registry.register(load_skill_tool)
+    install_skill_tool = InstallSkillTool(skill_loader)
+    registry.register(install_skill_tool)
+    skill_executor = SkillExecutor(skill_loader)
+    loaded_skill_names = ", ".join(skill_loader.names())
+    logger.info("已加载 %d 个 skill: %s", len(skill_loader.names()), loaded_skill_names)
     manager = await mcp.new_manager(mcp.load_config(root), version=__version__)
     try:
         for remote_tool in manager.tools():
@@ -85,7 +101,7 @@ async def _run(root: str, ses_ctx: SessionContext) -> int:
             print(f"权限引擎降级: {err}", file=sys.stderr)
         # 会话级运行时：复用启动时建好的会话，使日志文件与运行时指向同一会话（F1/F2）
         runtime = new_runtime(workspace=root, session=ses_ctx)
-        await PotatoCodeApp(
+        app = PotatoCodeApp(
             cfg.providers,
             __version__,
             registry,
@@ -98,7 +114,14 @@ async def _run(root: str, ses_ctx: SessionContext) -> int:
             memory_text=memory_text,
             sessions_dir=sessions_root(root),
             workspace=root,
-        ).run_async()
+            skill_loader=skill_loader,
+            skill_executor=skill_executor,
+            load_skill_tool=load_skill_tool,
+            skill_catalog_text=build_skill_catalog_text(skill_loader),
+        )
+        # skill 安装完成后重建斜杠命令 + 刷新 Agent 目录（无需重启即可使用，F19）
+        install_skill_tool.set_on_installed(app.rebind_skill_commands)
+        await app.run_async()
     except KeyboardInterrupt:
         pass  # 终端层的 Ctrl+C，安静退出
     finally:

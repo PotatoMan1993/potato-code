@@ -21,6 +21,8 @@ class Kind(Enum):
 
 # 处理函数签名：只依赖 UI 抽象，不持有 TUI 具体类型（F33/F35）
 Handler = Callable[["UI"], Awaitable[None]]
+# 带参数命令的处理函数签名：额外接收参数尾巴（ch13 /skill list | info <name> | reload）
+ArgsHandler = Callable[["UI", str], Awaitable[None]]
 
 
 @dataclass(slots=True)
@@ -33,3 +35,5 @@ class Command:
     handler: Handler
     aliases: list[str] = field(default_factory=list)  # 不带 "/" 前缀，全小写，全局唯一
     hidden: bool = False  # True 时 /help 与补全菜单都不显示，但 dispatcher 仍可命中（F28）
+    accepts_args: bool = False  # True 时输入可携带参数尾巴，交给 args_handler（ch13）
+    args_handler: ArgsHandler | None = None  # accepts_args=True 时必须提供（ch13）

@@ -70,6 +70,10 @@ async def test_amain_registers_mcp_tools_and_closes_manager(monkeypatch):
             memory_text="",
             sessions_dir="",
             workspace="",
+            skill_loader=None,
+            skill_executor=None,
+            load_skill_tool=None,
+            skill_catalog_text="",
         ):
             observed["providers"] = providers
             observed["definitions"] = registry.definitions()
@@ -78,6 +82,9 @@ async def test_amain_registers_mcp_tools_and_closes_manager(monkeypatch):
             observed["mem_mgr"] = mem_mgr
             observed["instruction_text"] = instruction_text
             observed["sessions_dir"] = sessions_dir
+
+        def rebind_skill_commands(self):
+            observed["rebound"] = True
 
         async def run_async(self):
             observed["ran"] = True
@@ -93,7 +100,8 @@ async def test_amain_registers_mcp_tools_and_closes_manager(monkeypatch):
     assert exit_code == 0
     assert observed["mcp_config"] == "loaded-mcp-config"
     assert observed["version"] == cli.__version__
-    assert len(observed["definitions"]) == 7
+    # 6 个核心工具 + ch13 新增的 LoadSkill / InstallSkill + 1 个 MCP 远程工具
+    assert len(observed["definitions"]) == 9
     assert observed["definitions"][-1].name == "mcp__demo__echo"
     assert observed["ran"] is True
     assert manager.closed is True
@@ -109,6 +117,9 @@ async def test_amain_closes_manager_when_tui_fails(monkeypatch):
 
     class BrokenApp:
         def __init__(self, *args, **kwargs):
+            pass
+
+        def rebind_skill_commands(self):
             pass
 
         async def run_async(self):

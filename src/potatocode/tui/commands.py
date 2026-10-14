@@ -14,14 +14,17 @@ from typing import TYPE_CHECKING
 from textual.widgets import RichLog
 
 from ..agent import CompactEvent, CompactPhase
-from ..command import Kind, parse
+from ..command import Kind
+from ..command.dispatch import parse_with_args
 from ..command.registry import Registry as CommandRegistry
+from ..command.skill_register import build_skill_catalog_text, register_skill_commands
 from ..compact import new_session_context
 from ..permission import Mode
 from ..session import Writer
 from .resume import begin_resume
 from .view import (
     SessionState,
+    assistant_block,
     error_notice_block,
     format_compact_notice,
     notice_block,
@@ -32,6 +35,7 @@ if TYPE_CHECKING:
     from ..agent import Agent
     from ..llm import Provider
     from ..memory import Manager as MemoryManager
+    from ..permission.engine import Engine
     from ..tool import Registry as ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -59,6 +63,10 @@ class CommandMixin:
     compact_task: asyncio.Task | None
     _tool_registry: ToolRegistry
     cmd_registry: CommandRegistry
+    # ch13 Skill 系统：loader / executor 由 cli 装配后传入；fork 结果暂存队列
+    skill_loader: object  # SkillLoader | None
+    skill_executor: object  # SkillExecutor | None
+    _pending_fork_texts: list[str]
 
     if TYPE_CHECKING:
 
@@ -143,6 +151,73 @@ class CommandMixin:
     def idle(self) -> bool:
         return self.state is SessionState.IDLE
 
+    # ────────────────── UI Protocol：Skill 支持（ch13） ──────────────────
+
+    def current_agent(self) -> Agent | None:
+        """当前主 Agent（未选定 provider 时为 None）：/clear 钩子与 skill 命令用。"""
+        return self.ensure_agent()
+
+    def append_assistant_message(self, text: str) -> None:
+        """fork skill 结果回流：追加 assistant 回合 + scrollback 展示（plan fork 分支）。
+
+        回合进行中历史正被主循环改写，此时追加会插进 assistant↔tool 配对中间破坏
+        历史合法性，因此先暂存，当前回合收尾时再补写（_flush_pending_skill_results）。
+        """
+        if self.state is SessionState.IDLE:
+            self._append_skill_result_now(text)
+        else:
+            self._pending_fork_texts.append(text)
+
+    def _append_skill_result_now(self, text: str) -> None:
+        """立即把一条 fork 结果写入 conv 历史 + scrollback（idle 态才可直接调用）。"""
+        self.conv.add_assistant(text)
+        self.query_one("#log", RichLog).write(assistant_block(text, 0.0))  # type: ignore[attr-defined]
+
+    def _flush_pending_skill_results(self) -> None:
+        """回合收尾后补写暂存的 fork 结果，保持 conv 与 scrollback 顺序一致。"""
+        while self._pending_fork_texts:
+            pending_text = self._pending_fork_texts.pop(0)
+            self._append_skill_result_now(pending_text)
+
+    def rebind_skill_commands(self) -> None:
+        """skill 目录变化后重建斜杠命令并刷新 Agent 的 Available Skills 目录。
+
+        InstallSkill 安装完成与 /skill reload 都走这里：命令清单、补全菜单、
+        env 段的目录文本三者同步更新。
+        """
+        if self.skill_loader is None or self.skill_executor is None:
+            return
+        register_skill_commands(self.cmd_registry, self.skill_loader, self.skill_executor)  # type: ignore[arg-type]
+        agent = self.ensure_agent()
+        if agent is not None:
+            agent.set_skill_catalog(build_skill_catalog_text(self.skill_loader))  # type: ignore[arg-type]
+
+    # ────────────────── SkillHost 协议（skills 包 fork 执行的宿主能力面） ──────────────────
+
+    def skill_agent(self) -> Agent | None:
+        return self.ensure_agent()
+
+    def skill_provider(self) -> Provider | None:
+        return self.provider
+
+    def skill_tool_registry(self) -> ToolRegistry:
+        return self._tool_registry
+
+    def skill_engine(self) -> Engine:
+        return self.engine
+
+    def skill_version(self) -> str:
+        return self._version
+
+    def skill_conversation(self) -> object:
+        return self.conv
+
+    def skill_runtime(self) -> object:
+        return self.runtime
+
+    def skill_workspace(self) -> str:
+        return self.workspace
+
     # ────────────────── UI Protocol：影响界面动作 ──────────────────
 
     def quit(self) -> None:
@@ -216,11 +291,15 @@ class CommandMixin:
 
         非 `/` 开头返回 False，上层送 Agent（F3）；未命中输出 /help 引导（F6）；
         UI/PROMPT 类命令仅 idle 可执行（N3a），/exit 沿用既有行为任何时候都允许。
+        ch13 扩展：命令声明 accepts_args 时可携带参数尾巴，由 args_handler 消费；
+        其余命令携带参数尾巴仍按未命中处理（F7 行为不回归）。
         """
-        name, is_slash = parse(text)
+        name, args, is_slash = parse_with_args(text)
         if not is_slash:
             return False
         cmd = self.cmd_registry.lookup(name) if name else None
+        if cmd is not None and args and not cmd.accepts_args:
+            cmd = None  # 携带参数尾巴但命令不接受参数：按未命中处理（F7）
         if cmd is None:
             # 退化输入（纯 / 或带参数尾巴）不回显名字，避免出现悬空斜杠
             if name:
@@ -232,7 +311,10 @@ class CommandMixin:
             self.error("请等待当前任务完成")
             return True
         try:
-            await cmd.handler(self)
+            if cmd.accepts_args and cmd.args_handler is not None:
+                await cmd.args_handler(self, args)
+            else:
+                await cmd.handler(self)
         except Exception as exc:
             logger.exception("命令 /%s 执行失败", cmd.name)
             self.error(f"{type(exc).__name__}: {exc}")

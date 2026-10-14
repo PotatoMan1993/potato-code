@@ -19,13 +19,16 @@ class Registry:
     def register(self, cmd: Command) -> None:
         """登记一条命令；名字/别名冲突立即抛 RuntimeError（F2，启动期报错不进运行时）。
 
-        非法形态（空名、含大写）同样拒绝注册，避免静默注册一条永远命不中的命令。
+        非法形态（空名、含大写）同样拒绝注册，避免静默注册一条永远命不中的命令；
+        声明接受参数的命令必须同时提供 args_handler（ch13）。
         """
         if not cmd.name or cmd.name != cmd.name.lower():
             raise ValueError(f"命令名必须非空且全小写: {cmd.name!r}")
         for alias in cmd.aliases:
             if not alias or alias != alias.lower():
                 raise ValueError(f"命令别名必须非空且全小写: {alias!r}")
+        if cmd.accepts_args and cmd.args_handler is None:
+            raise ValueError(f"命令 {cmd.name!r} 声明接受参数但缺少 args_handler")
         for key in (cmd.name, *cmd.aliases):
             if key in self._by_name:
                 raise RuntimeError(f"command conflict: {key}")
@@ -34,6 +37,21 @@ class Registry:
         if not cmd.hidden:
             self._visible.append(cmd)
             self._visible.sort(key=lambda c: c.name)
+
+    def unregister(self, name: str) -> bool:
+        """按名（含其别名）摘除一条命令；未命中返回 False（ch13 skill 命令重建用）。
+
+        skill 命令 reload 前先摘旧、InstallSkill 后重建，都依赖本方法幂等摘除；
+        若被摘的是 shadow 了内置命令的 skill 命令，内置命令不会自动回归（会话内
+        保持被覆盖状态，重启后恢复）。
+        """
+        cmd = self._by_name.get(name.strip().lower())
+        if cmd is None:
+            return False
+        for key in (cmd.name, *cmd.aliases):
+            self._by_name.pop(key, None)
+        self._visible = [c for c in self._visible if c is not cmd]
+        return True
 
     def lookup(self, name: str) -> Command | None:
         """按名字查找命令（主名与别名同表），大小写不敏感；未命中返回 None（F4）。"""

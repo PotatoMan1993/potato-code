@@ -12,6 +12,7 @@ dependencies = [
     "openai>=1.50",
     "pyyaml>=6",
     "mcp>=1.0",
+    "httpx>=0.27",
 ]
 
 [project.scripts]

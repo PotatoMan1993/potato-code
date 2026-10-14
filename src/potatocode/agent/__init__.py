@@ -47,6 +47,7 @@ from ..llm import Usage as LlmUsage
 from ..memory import Manager as MemoryManager
 from ..permission import Decision, Mode, Outcome
 from ..permission.engine import Engine
+from ..prompt import ActiveSkillEntry
 from ..tool import DEFAULT_TIMEOUT, Registry
 from .event import CompactEvent, CompactPhase
 from .runtime import SessionRuntime, new_runtime
@@ -215,6 +216,7 @@ class Agent:
         memory_manager: MemoryManager | None = None,
         instruction_text: str = "",
         memory_text: str = "",
+        skill_catalog: str = "",
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -229,6 +231,23 @@ class Agent:
         self._instruction_text = instruction_text
         self._memory_text = memory_text
         self._mem_tasks: set[asyncio.Task] = set()  # 后台记忆更新任务（持引用防被回收）
+        # ch13 Skill 系统：已激活 skill 的 SOP（name → body）与 Available Skills 目录文本。
+        # SOP 由 inline 执行路径 / LoadSkill 工具写入（F6/F10），每轮重建 env 段时注入；
+        # 目录文本启动期注入一次，/skill reload 或安装 skill 后由 TUI 刷新（F11）。
+        self.active_skills: dict[str, str] = {}
+        self._skill_catalog = skill_catalog
+
+    def activate_skill(self, name: str, prompt_body: str) -> None:
+        """激活（钉住）一个 skill 的 SOP：主循环每轮重建 env 段时都会注入（F6）。"""
+        self.active_skills[name] = prompt_body
+
+    def clear_active_skills(self) -> None:
+        """清空已激活 skill（/clear 时调用，之后 env 段不再注入旧 SOP，F18）。"""
+        self.active_skills.clear()
+
+    def set_skill_catalog(self, catalog: str) -> None:
+        """更新 Available Skills 目录文本（启动期注入，reload / 安装后刷新，F11）。"""
+        self._skill_catalog = catalog
 
     async def run(
         self,
@@ -292,8 +311,7 @@ class Agent:
         cancel: asyncio.Event,
     ) -> AsyncIterator[Event]:
         """ReAct 主循环本体：每轮先管理上下文，再请求、执行工具、回灌结果。"""
-        # 每次 run 起始采集环境、装配稳定系统提示（普通/规划一致；规划提醒已移出系统通道）
-        env_text = prompt.gather_environment(self._version, self._provider.model).render()
+        # 每次 run 起始装配稳定系统提示（普通/规划一致；规划提醒已移出系统通道）
         sys = prompt.build_system_prompt(self._instruction_text, self._memory_text)
         if mode == Mode.PLAN:
             defs = self._registry.read_only_definitions()
@@ -303,6 +321,14 @@ class Agent:
         unknown_run = 0
         for it in range(1, MAX_ITERATIONS + 1):
             yield Event(iter=it)
+            # 环境段每轮迭代重建（F6/T6）：本轮 LoadSkill 激活的 SOP 下一轮请求即可见
+            active_entries = [
+                ActiveSkillEntry(name=skill_name, body=skill_body)
+                for skill_name, skill_body in self.active_skills.items()
+            ]
+            env_text = prompt.build_environment_context(
+                self._version, self._provider.model, self._skill_catalog, active_entries
+            )
             if cancel.is_set():
                 self._finish_cancelled(conv)
                 return

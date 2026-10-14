@@ -91,6 +91,10 @@ class Registry:
         """按名查找工具，未命中返回 None。"""
         return self._tools.get(name)
 
+    def names(self) -> list[str]:
+        """按注册顺序返回全部工具名（fork 注册中心构建等遍历场景用，ch13）。"""
+        return list(self._order)
+
     def count(self) -> int:
         """当前已注册工具数量（O(1)，/status 查询用，ch12 T0c）。"""
         return len(self._tools)

@@ -20,6 +20,8 @@ from ..agent import Agent, ApprovalRequest
 from ..agent.runtime import SessionRuntime, new_runtime
 from ..command import Registry as CommandRegistry
 from ..command import register_builtins
+from ..command.builtin_skill import register_skill_manage_command
+from ..command.skill_register import register_skill_commands
 from ..compact import sessions_root
 from ..config import ProviderConfig, effective_context_window
 from ..conversation import Conversation
@@ -30,7 +32,10 @@ from ..permission import Mode, Outcome
 from ..permission.engine import Engine
 from ..prompt import render_banner
 from ..session import SessionInfo, Writer
+from ..skills.executor import SkillExecutor
+from ..skills.loader import SkillLoader
 from ..tool import Registry
+from ..tool.load_skill import LoadSkill
 from .commands import CommandMixin
 from .complete import CompletionMenu, CompletionMixin
 from .resume import ResumeSelect, do_resume_session
@@ -228,6 +233,10 @@ class PotatoCodeApp(CompletionMixin, CommandMixin, StreamMixin, App):
         memory_text: str = "",
         sessions_dir: str = "",
         workspace: str = "",
+        skill_loader: SkillLoader | None = None,
+        skill_executor: SkillExecutor | None = None,
+        load_skill_tool: LoadSkill | None = None,
+        skill_catalog_text: str = "",
     ) -> None:
         super().__init__()
         self.providers = providers
@@ -237,6 +246,22 @@ class PotatoCodeApp(CompletionMixin, CommandMixin, StreamMixin, App):
         # 斜杠命令注册中心：与工具注册中心相互独立（ch12 G1/G4）
         cmd_reg = CommandRegistry()
         register_builtins(cmd_reg)  # 名字/别名冲突在启动期立即抛错（F2）
+        # ch13 Skill 系统：loader / executor 由 cli 装配后传入；未注入时 skill 功能关闭
+        # （单测与脚本场景）。注册顺序：先内置命令，skill 命令随后——同名时 skill
+        # 优先覆盖旧 handler（F14）。
+        self.skill_loader = skill_loader
+        self.skill_executor = skill_executor
+        self._load_skill_tool = load_skill_tool
+        self._skill_catalog_text = skill_catalog_text
+        self._pending_fork_texts: list[str] = []  # fork 结果暂存（回合进行中不可写历史）
+        if skill_loader is not None and skill_executor is not None:
+            register_skill_commands(cmd_reg, skill_loader, skill_executor)
+            register_skill_manage_command(
+                cmd_reg, skill_loader, on_reload=self.rebind_skill_commands
+            )
+        if load_skill_tool is not None:
+            # 注入 getter：Agent 惰性构造 / 换 provider 重建后引用依然有效
+            load_skill_tool.set_agent(self.ensure_agent)
         self.cmd_registry: CommandRegistry = cmd_reg
         self.completion = CompletionMenu()
         self.engine = engine  # 权限引擎（前四层），模式切换只影响后续兜底裁决
@@ -362,6 +387,7 @@ class PotatoCodeApp(CompletionMixin, CommandMixin, StreamMixin, App):
             memory_manager=self.mem_mgr,
             instruction_text=self._instruction_text,
             memory_text=self._memory_text,
+            skill_catalog=self._skill_catalog_text,
         )
         return self.agent
 

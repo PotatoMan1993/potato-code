@@ -7,9 +7,12 @@ handler 只依赖该协议，不持有任何 Textual 类型；`PotatoCodeApp` �
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from ..permission import Mode
+
+if TYPE_CHECKING:
+    from ..agent import Agent  # 仅类型引用：current_agent 的返回值（ch13）
 
 
 class UI(Protocol):
@@ -63,6 +66,15 @@ class UI(Protocol):
     def open_resume_menu(self) -> None: ...
 
     def clear_and_new_session(self) -> None: ...
+
+    # ── Skill 支持（ch13） ──
+    def current_agent(self) -> Agent | None:
+        """当前主 Agent（未选定 provider 时为 None）；/clear 钩子与 skill 命令用。"""
+        ...
+
+    def append_assistant_message(self, text: str) -> None:
+        """向主对话追加一条 assistant 消息并展示（fork skill 结果回流用）。"""
+        ...
 
     # ── 状态机查询 ──
     def idle(self) -> bool: ...
@@ -123,6 +135,12 @@ class NopUI:
         pass
 
     def clear_and_new_session(self) -> None:
+        pass
+
+    def current_agent(self) -> Agent | None:
+        return None
+
+    def append_assistant_message(self, text: str) -> None:
         pass
 
     def idle(self) -> bool:

@@ -12,6 +12,13 @@ from __future__ import annotations
 from .environment import Environment, gather_environment
 from .modules import Module, fixed_modules, optional_modules
 from .reminder import EXECUTE_DIRECTIVE, plan_reminder, system_reminder
+from .skills_block import (
+    ActiveSkillEntry,
+    SkillCatalogItem,
+    build_environment_context,
+    render_active_skills_block,
+    render_skills_catalog,
+)
 
 
 def assemble_system(mods: list[Module]) -> str:
@@ -57,16 +64,21 @@ def render_banner(version: str, cwd: str) -> str:
 
 
 __all__ = [
+    "ActiveSkillEntry",
     "BANNER",
     "Environment",
     "EXECUTE_DIRECTIVE",
     "Module",
+    "SkillCatalogItem",
     "assemble_system",
+    "build_environment_context",
     "build_system_prompt",
     "fixed_modules",
     "gather_environment",
     "optional_modules",
     "plan_reminder",
+    "render_active_skills_block",
     "render_banner",
+    "render_skills_catalog",
     "system_reminder",
 ]

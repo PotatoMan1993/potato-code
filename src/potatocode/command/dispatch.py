@@ -28,3 +28,23 @@ def parse(input_text: str) -> tuple[str, bool]:
     if not name:  # 形如 "//" 的退化输入
         return ("", True)
     return (name, True)
+
+
+def parse_with_args(input_text: str) -> tuple[str, str, bool]:
+    """解析输入，返回 `(命令名, 参数尾巴, 是否斜杠输入)`（ch13 扩展）。
+
+    基础规则与 parse 完全一致；差别在于携带参数尾巴的输入不再一律按未命中丢弃，
+    而是把尾巴原样带回，由 dispatcher 查表决定：命令声明 accepts_args 才消费参数，
+    否则仍按未命中处理（保持 ch12 F7 行为不回归）。
+    """
+    text = input_text.strip()
+    if not text.startswith("/"):
+        return ("", "", False)
+    rest = text[1:]
+    if not rest.strip():
+        return ("", "", True)  # 纯 "/"
+    head, _, tail = rest.partition(" ")
+    name = head.strip("/").lower()
+    if not name:  # 形如 "//" 或 "/ xxx" 的退化输入
+        return ("", "", True)
+    return (name, tail.strip(), True)

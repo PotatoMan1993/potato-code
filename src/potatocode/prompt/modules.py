@@ -82,7 +82,9 @@ def optional_modules(instructions: str = "", memory: str = "") -> list[Module]:
     """三个可选槽（自定义指令 / 已激活 Skill / 长期记忆）。
 
     自定义指令与长期记忆的内容由调用方注入（ch11 F43）：为空则装配时自动跳过，
-    不留下多余空行；已激活 Skill 仍留空待后续章节接入。
+    不留下多余空行。已激活 Skill 槽位自 ch13 起保持空置——Skill 目录与已激活
+    SOP 改走 environment 段（prompt.skills_block.build_environment_context），
+    本槽位仅为兼容槽位编号而保留。
     """
     return [
         Module(name="自定义指令", priority=80, content=instructions),

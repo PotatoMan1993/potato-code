@@ -67,6 +67,8 @@ class StreamMixin:
 
         def _update_statusbar(self) -> None: ...
 
+        def _flush_pending_skill_results(self) -> None: ...
+
         def ensure_agent(self) -> Agent | None: ...
 
     async def _consume_agent_events(self) -> None:
@@ -228,6 +230,7 @@ class StreamMixin:
         self._stop_turn()
         log = self.query_one("#log", RichLog)  # type: ignore[attr-defined]
         log.write(assistant_block(reply, elapsed))
+        self._flush_pending_skill_results()  # 补写回合期间完成的 fork skill 结果（ch13）
         self.state = SessionState.IDLE
         self._refocus_input()
 
@@ -239,6 +242,7 @@ class StreamMixin:
         self._stop_turn()
         log = self.query_one("#log", RichLog)  # type: ignore[attr-defined]
         log.write(notice_block(NOTICE_CANCELLED))
+        self._flush_pending_skill_results()  # 补写回合期间完成的 fork skill 结果（ch13）
         self.state = SessionState.IDLE
         self._refocus_input()
 
@@ -247,6 +251,7 @@ class StreamMixin:
         self._stop_turn()
         log = self.query_one("#log", RichLog)  # type: ignore[attr-defined]
         log.write(error_block(err))
+        self._flush_pending_skill_results()  # 补写回合期间完成的 fork skill 结果（ch13）
         self.state = SessionState.IDLE
         self._refocus_input()
 
