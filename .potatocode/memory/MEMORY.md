@@ -1,0 +1,1 @@
+- [project_knowledge] PotatoCode 项目概述 — PotatoCode 是用 Python 3.12 和 Textual 开发的终端 AI 编程助手，支持 Anthro…（project_knowledge_potatocode_overview.md）

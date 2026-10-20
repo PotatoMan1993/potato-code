@@ -76,6 +76,10 @@ class UI(Protocol):
         """向主对话追加一条 assistant 消息并展示（fork skill 结果回流用）。"""
         ...
 
+    def skill_deliver_result(self, text: str) -> None:
+        """SkillHost 协议复用：fork skill 结果回流（实现通常委托上一方法）。"""
+        ...
+
     # ── 状态机查询 ──
     def idle(self) -> bool: ...
 
@@ -141,6 +145,9 @@ class NopUI:
         return None
 
     def append_assistant_message(self, text: str) -> None:
+        pass
+
+    def skill_deliver_result(self, text: str) -> None:
         pass
 
     def idle(self) -> bool:

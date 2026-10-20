@@ -47,7 +47,6 @@ class SkillLoader:
     def load_all(self) -> None:
         """按 项目 → 用户 顺序扫描两级目录，同 name 首次出现者保留（F3/N5）。"""
         self._skills.clear()
-        self._cache.clear()
         self._scan_directory(self._project_dir, "project")
         self._scan_directory(self._user_dir, "user")
 

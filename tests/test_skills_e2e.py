@@ -1,8 +1,8 @@
 """ch13 Skill 系统端到端验证（T10/checklist §4）：无头 TUI 驱动全链路。
 
 Windows 下无法用 tmux 驱动交互 TUI，这里用 Textual 的 `run_test()` 无头跑真实
-PotatoCodeApp：fake provider 脚本化响应，捕获每轮请求的 environment 段，验证
-/help、/skill list、inline 显式调用、热重载、LoadSkill 意图触发与 /clear 清理。
+PotatoCodeApp：fake provider 脚本化响应，捕获每轮请求的消息文本，验证 /help、
+/skill list、inline 显式调用、热重载、LoadSkill 意图触发与 /clear 清理。
 不发起任何真实网络请求。
 """
 
@@ -89,10 +89,11 @@ def make_app(workspace: Path, provider: ScriptedProvider) -> PotatoCodeApp:
     registry = new_default_registry()
     skill_loader = SkillLoader(str(workspace))
     skill_loader.load_all()
+    skill_executor = SkillExecutor(skill_loader)
     load_skill_tool = LoadSkill()
     load_skill_tool.set_loader(skill_loader)
+    load_skill_tool.set_executor(skill_executor)
     registry.register(load_skill_tool)
-    skill_executor = SkillExecutor(skill_loader)
     engine, _ = new_engine(str(workspace))
     app = PotatoCodeApp(
         [ProviderConfig(name="fake", protocol="anthropic", api_key="dummy", model="fake-model")],
@@ -122,6 +123,17 @@ def latest_environment(provider: ScriptedProvider) -> str:
     """最近一轮请求的 environment 段文本。"""
     assert provider.requests, "fake provider 没有收到任何请求"
     return provider.requests[-1].system.environment
+
+
+def latest_request_texts(provider: ScriptedProvider) -> str:
+    """最近一轮请求里的全部文本（消息 content + tool 结果 content），便于断言。"""
+    assert provider.requests, "fake provider 没有收到任何请求"
+    parts: list[str] = []
+    for message in provider.requests[-1].messages:
+        parts.append(message.content)
+        for result in message.tool_results:
+            parts.append(result.content)
+    return "\n".join(parts)
 
 
 async def send_user_message(app: PotatoCodeApp, text: str) -> None:
@@ -181,18 +193,15 @@ async def test_e2e_skill_list_and_info(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_e2e_inline_skill_hot_reload_and_clear(tmp_path: Path) -> None:
-    """inline 显式调用 → SOP 进 env；热重载即时生效；/clear 后 env 不再出现（§4）。"""
+    """inline 显式调用 → SOP 进对话消息；热重载即时生效；/clear 后历史清空（§4）。"""
     skill_md = write_test_skill(tmp_path, SKILL_BODY_V1)
     provider = ScriptedProvider([[StreamEvent(text="ok"), StreamEvent(done=True)]])
     app = make_app(tmp_path, provider)
     async with app.run_test() as pilot:
-        # 1) /test-skill：SOP 钉到 env，触发的一轮请求 environment 里能看到
+        # 1) /test-skill：SOP 作为注入消息进入对话，触发的这轮请求里能看到
         await app.dispatch_slash(f"/{SKILL_NAME}")
         await wait_until_idle(app)
-        environment = latest_environment(provider)
-        assert "## Active Skills" in environment
-        assert f"### Skill: {SKILL_NAME}" in environment
-        assert SKILL_BODY_V1 in environment
+        assert SKILL_BODY_V1 in latest_request_texts(provider)
 
         # 2) 热重载：改一行不重启，再调一次，新行进 prompt（§4 第 4 条）
         skill_md.write_text(
@@ -206,20 +215,22 @@ async def test_e2e_inline_skill_hot_reload_and_clear(tmp_path: Path) -> None:
         )
         await app.dispatch_slash(f"/{SKILL_NAME}")
         await wait_until_idle(app)
-        assert SKILL_BODY_V2 in latest_environment(provider)
-        assert SKILL_BODY_V1 not in latest_environment(provider)
+        # SOP 进对话历史：本轮新注入的（最后一条）消息是热重载后的 V2；
+        # 上一轮的 V1 留在历史里，不再断言其消失
+        assert provider.requests[-1].messages[-1].content == SKILL_BODY_V2
 
-        # 3) /clear：立即再发任意消息，env 里不再出现 Active Skills（§4 第 6 条）
+        # 3) /clear：开新会话后历史清空，旧 SOP 不再出现在请求里（§4 第 6 条）
         await app.dispatch_slash("/clear")
         await pilot.pause()
         await send_user_message(app, "随便说点什么")
         await wait_until_idle(app)
-        assert "## Active Skills" not in latest_environment(provider)
+        assert SKILL_BODY_V1 not in latest_request_texts(provider)
+        assert SKILL_BODY_V2 not in latest_request_texts(provider)
 
 
 @pytest.mark.asyncio
 async def test_e2e_load_skill_intent_trigger(tmp_path: Path) -> None:
-    """自然语言意图触发：Agent 调 LoadSkill → 下一轮 env 出现 SOP（§4 第 5 条）。"""
+    """自然语言意图触发：Agent 调 LoadSkill → toolResult 携带 SOP 进对话（§4 第 5 条）。"""
     write_test_skill(tmp_path, SKILL_BODY_V1)
     provider = ScriptedProvider([
         [StreamEvent(tool_calls=[ToolCall(id="x", name="LoadSkill",
@@ -230,6 +241,6 @@ async def test_e2e_load_skill_intent_trigger(tmp_path: Path) -> None:
     async with app.run_test():
         await send_user_message(app, "请用 test-skill 这个 skill 帮我做事")
         await wait_until_idle(app)
-        # 第 2 轮请求的 env 段里出现 SOP（LoadSkill 激活后的下一轮，spec 5.5）
-        assert "## Active Skills" in latest_environment(provider)
-        assert SKILL_BODY_V1 in latest_environment(provider)
+        # 第 2 轮请求里 toolResult 携带 SOP（LoadSkill inline 分支，spec 5.5）
+        assert SKILL_BODY_V1 in latest_request_texts(provider)
+        assert "## Active Skills" not in latest_environment(provider)

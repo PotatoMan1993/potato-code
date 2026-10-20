@@ -6,6 +6,7 @@ Agent 以 MagicMock 替代真实 provider；fork 路径用脚本化 fake provide
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -28,10 +29,7 @@ from potatocode.conversation import Conversation
 from potatocode.llm import Request, StreamEvent
 from potatocode.permission import new_engine
 from potatocode.prompt import (
-    ActiveSkillEntry,
     SkillCatalogItem,
-    build_environment_context,
-    render_active_skills_block,
     render_skills_catalog,
 )
 from potatocode.skills.executor import SkillExecutor
@@ -138,6 +136,7 @@ class FakeHost:
         self._engine = engine
         self._conversation = conversation if conversation is not None else Conversation()
         self._runtime = new_runtime(workspace=str(tmp_path))
+        self.delivered: list[str] = []  # skill_deliver_result 回流的 fork 结果
 
     def skill_agent(self):
         return self._agent
@@ -162,6 +161,9 @@ class FakeHost:
 
     def skill_workspace(self) -> str:
         return "."
+
+    def skill_deliver_result(self, text: str) -> None:
+        self.delivered.append(text)
 
 
 # ────────────────────────── parser（T1/T11） ──────────────────────────
@@ -371,21 +373,45 @@ class TestSkillLoader:
 # ────────────────────────── executor（T4/T5） ──────────────────────────
 
 
-class TestSkillExecutorInline:
-    def test_execute_inline_pins_sop_to_agent(self, tmp_path: Path) -> None:
-        agent = MagicMock()
-        host = FakeHost(tmp_path, agent=agent)
+class TestSkillExecutorSpawnFork:
+    @pytest.mark.asyncio
+    async def test_spawn_fork_delivers_result_to_host(self, tmp_path: Path) -> None:
+        provider = ScriptedProvider([[StreamEvent(text="BG RESULT"), StreamEvent(done=True)]])
+        host = FakeHost(tmp_path, provider=provider)
         executor = SkillExecutor(make_loader(tmp_path))
-        skill = SkillDef(name="alpha", description="d", prompt_body="DO $ARGUMENTS")
-        executor.execute_inline(skill, "NOW", host)
-        agent.activate_skill.assert_called_once_with("alpha", "DO NOW")
+        skill = SkillDef(name="fk", description="d", prompt_body="GO", mode="fork", context="none")
+        task = executor.spawn_fork(skill, "", host)
+        await asyncio.wait_for(task, 5)
+        assert host.delivered == ["BG RESULT"]
 
-    def test_execute_inline_without_agent_raises(self, tmp_path: Path) -> None:
-        host = FakeHost(tmp_path, agent=None)
+    @pytest.mark.asyncio
+    async def test_spawn_fork_substitutes_arguments(self, tmp_path: Path) -> None:
+        provider = ScriptedProvider([[StreamEvent(text="ok"), StreamEvent(done=True)]])
+        host = FakeHost(tmp_path, provider=provider)
         executor = SkillExecutor(make_loader(tmp_path))
-        skill = SkillDef(name="alpha", description="d", prompt_body="BODY")
-        with pytest.raises(RuntimeError, match="provider"):
-            executor.execute_inline(skill, "", host)
+        skill = SkillDef(
+            name="fk", description="d", prompt_body="GO $ARGUMENTS", mode="fork", context="none"
+        )
+        task = executor.spawn_fork(skill, "NOW", host)
+        await asyncio.wait_for(task, 5)
+        assert provider.requests[-1].messages[-1].content.endswith("GO NOW")
+
+    @pytest.mark.asyncio
+    async def test_spawn_fork_delivers_error_text_when_execute_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        host = FakeHost(tmp_path)
+        executor = SkillExecutor(make_loader(tmp_path))
+        skill = SkillDef(name="fk", description="d", prompt_body="GO", mode="fork")
+
+        async def _boom(*args: object, **kwargs: object) -> str:
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(executor, "execute_fork", _boom)
+        task = executor.spawn_fork(skill, "", host)
+        await asyncio.wait_for(task, 5)
+        assert len(host.delivered) == 1
+        assert "fork 失败" in host.delivered[0]
 
 
 class TestSkillExecutorFork:
@@ -468,18 +494,54 @@ class TestLoadSkillTool:
         assert "not properly initialized" in result.content
 
     @pytest.mark.asyncio
-    async def test_load_existing_skill_activates(self, tmp_path: Path) -> None:
+    async def test_inline_returns_sop_body_with_args(self, tmp_path: Path) -> None:
         loader = make_loader(tmp_path)
-        write_skill_file(tmp_path / "ws" / ".potatocode" / "skills" / "alpha.md")
+        write_skill_file(
+            tmp_path / "ws" / ".potatocode" / "skills" / "alpha.md", body="DO $ARGUMENTS"
+        )
         loader.load_all()
-        agent = MagicMock()
         tool = LoadSkill()
         tool.set_loader(loader)
-        tool.set_agent(lambda: agent)  # 显式 getter：MagicMock 本身 callable，会被误当 getter
-        result = await tool.execute(json.dumps({"name": "alpha"}))
+        tool.set_agent(lambda: MagicMock())
+        result = await tool.execute(json.dumps({"name": "alpha", "args": "NOW"}))
         assert result.is_error is False
-        assert "Skill 'alpha' activated" in result.content
-        agent.activate_skill.assert_called_once_with("alpha", "SOP BODY")
+        assert "activated" in result.content
+        assert "DO NOW" in result.content  # $ARGUMENTS 已替换
+
+    @pytest.mark.asyncio
+    async def test_fork_starts_background_and_reports(self, tmp_path: Path) -> None:
+        loader = make_loader(tmp_path)
+        write_skill_file(tmp_path / "ws" / ".potatocode" / "skills" / "fk.md",
+                         name="fk", mode="fork")
+        loader.load_all()
+        provider = ScriptedProvider([[StreamEvent(text="BG DONE"), StreamEvent(done=True)]])
+        host = FakeHost(tmp_path, provider=provider)
+        executor = SkillExecutor(loader)
+        tool = LoadSkill()
+        tool.set_loader(loader)
+        tool.set_executor(executor)
+        tool.set_host(host)
+        tool.set_agent(lambda: MagicMock())
+        result = await tool.execute(json.dumps({"name": "fk"}))
+        assert result.is_error is False
+        assert "后台启动" in result.content  # 只报告启动状态，不阻塞等结果
+        deadline = asyncio.get_running_loop().time() + 5
+        while not host.delivered and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+        assert host.delivered == ["BG DONE"]  # 结果经宿主回流
+
+    @pytest.mark.asyncio
+    async def test_fork_without_executor_returns_error(self, tmp_path: Path) -> None:
+        loader = make_loader(tmp_path)
+        write_skill_file(tmp_path / "ws" / ".potatocode" / "skills" / "fk.md",
+                         name="fk", mode="fork")
+        loader.load_all()
+        tool = LoadSkill()
+        tool.set_loader(loader)
+        tool.set_agent(lambda: MagicMock())
+        result = await tool.execute(json.dumps({"name": "fk"}))
+        assert result.is_error is True
+        assert "not properly initialized" in result.content
 
     @pytest.mark.asyncio
     async def test_load_unknown_lists_catalog(self, tmp_path: Path) -> None:
@@ -517,23 +579,6 @@ class TestAgentSkillIntegration:
             runtime=new_runtime(workspace=str(tmp_path)),
         )
 
-    def test_activate_skill_adds_to_dict(self, tmp_path: Path) -> None:
-        agent = self.make_agent(tmp_path)
-        agent.activate_skill("commit", "STEP 1")
-        assert agent.active_skills == {"commit": "STEP 1"}
-
-    def test_activate_same_skill_overwrites(self, tmp_path: Path) -> None:
-        agent = self.make_agent(tmp_path)
-        agent.activate_skill("commit", "OLD")
-        agent.activate_skill("commit", "NEW")
-        assert agent.active_skills == {"commit": "NEW"}
-
-    def test_clear_active_skills_empties_dict(self, tmp_path: Path) -> None:
-        agent = self.make_agent(tmp_path)
-        agent.activate_skill("commit", "STEP 1")
-        agent.clear_active_skills()
-        assert agent.active_skills == {}
-
     def test_constructor_stores_skill_catalog(self, tmp_path: Path) -> None:
         agent = self.make_agent(tmp_path, skill_catalog="CATALOG TEXT")
         assert agent._skill_catalog == "CATALOG TEXT"
@@ -544,31 +589,14 @@ class TestAgentSkillIntegration:
         assert agent._skill_catalog == "NEW CATALOG"
 
 
-class TestEnvironmentContext:
-    def test_contains_active_skills_block(self) -> None:
-        text = build_environment_context(
-            "0.1.0", "m", "", [ActiveSkillEntry(name="commit", body="STEP 1\nSTEP 2")]
-        )
-        assert "## Active Skills" in text
-        assert "### Skill: commit" in text
-        assert "STEP 2" in text
-
-    def test_without_active_skills_no_block(self) -> None:
-        text = build_environment_context("0.1.0", "m", "", [])
-        assert "## Active Skills" not in text
-
-    def test_catalog_section_before_active_skills(self) -> None:
-        catalog = render_skills_catalog([SkillCatalogItem(name="alpha", description="d")])
-        text = build_environment_context(
-            "0.1.0", "m", catalog, [ActiveSkillEntry(name="alpha", body="B")]
-        )
-        assert text.index("## Available Skills") < text.index("## Active Skills")
-
-    def test_render_active_skills_block_empty(self) -> None:
-        assert render_active_skills_block([]) == ""
-
+class TestSkillsCatalogBlock:
     def test_render_catalog_empty(self) -> None:
         assert render_skills_catalog([]) == ""
+
+    def test_render_catalog_lists_items(self) -> None:
+        text = render_skills_catalog([SkillCatalogItem(name="alpha", description="d")])
+        assert "## Available Skills" in text
+        assert "- alpha: d" in text
 
 
 # ────────────────────────── 命令注册（T9/T11） ──────────────────────────

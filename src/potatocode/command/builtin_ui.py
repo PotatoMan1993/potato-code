@@ -38,13 +38,10 @@ async def handle_resume(ui: UI) -> None:
 
 
 async def handle_clear(ui: UI) -> None:
-    """/clear：结束当前会话、开启新会话，并清空已激活 skill（F17/ch13 F18）。
+    """/clear：结束当前会话、开启新会话（F17）。
 
-    清空已激活 skill 放在最前：之后 env 段重建时不再注入旧 SOP，开跑的新会话
-    从一开始就是干净的。
+    inline skill 的 SOP 现在随对话历史进会话存档，开新会话自然全部丢弃，
+    不再需要单独清理已激活 skill 的状态。
     """
-    agent = ui.current_agent()
-    if agent is not None:
-        agent.clear_active_skills()
     ui.clear_and_new_session()
     ui.println("已清空当前会话，开启新会话")

@@ -179,6 +179,10 @@ class CommandMixin:
             pending_text = self._pending_fork_texts.pop(0)
             self._append_skill_result_now(pending_text)
 
+    def skill_deliver_result(self, text: str) -> None:
+        """SkillHost 协议：fork 结果回流（复用 append_assistant_message 的暂存语义）。"""
+        self.append_assistant_message(text)
+
     def rebind_skill_commands(self) -> None:
         """skill 目录变化后重建斜杠命令并刷新 Agent 的 Available Skills 目录。
 

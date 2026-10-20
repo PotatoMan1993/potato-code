@@ -82,12 +82,13 @@ async def _run(root: str, ses_ctx: SessionContext) -> int:
     # 内置工具（在 Agent 构造前进注册中心，保证首轮请求就能看到 LoadSkill 定义）
     skill_loader = SkillLoader(root)
     skill_loader.load_all()
+    skill_executor = SkillExecutor(skill_loader)
     load_skill_tool = LoadSkill()
     load_skill_tool.set_loader(skill_loader)
+    load_skill_tool.set_executor(skill_executor)  # fork 分支后台启动子 Agent 用
     registry.register(load_skill_tool)
     install_skill_tool = InstallSkillTool(skill_loader)
     registry.register(install_skill_tool)
-    skill_executor = SkillExecutor(skill_loader)
     loaded_skill_names = ", ".join(skill_loader.names())
     logger.info("已加载 %d 个 skill: %s", len(skill_loader.names()), loaded_skill_names)
     manager = await mcp.new_manager(mcp.load_config(root), version=__version__)

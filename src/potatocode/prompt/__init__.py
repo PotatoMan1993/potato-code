@@ -13,10 +13,7 @@ from .environment import Environment, gather_environment
 from .modules import Module, fixed_modules, optional_modules
 from .reminder import EXECUTE_DIRECTIVE, plan_reminder, system_reminder
 from .skills_block import (
-    ActiveSkillEntry,
     SkillCatalogItem,
-    build_environment_context,
-    render_active_skills_block,
     render_skills_catalog,
 )
 
@@ -24,17 +21,17 @@ from .skills_block import (
 def assemble_system(mods: list[Module]) -> str:
     """按 priority 升序稳定排序、跳过空 content、以空行连接成完整系统提示（F1/AC1/AC2）。"""
     ordered = sorted(mods, key=lambda m: m.priority)
-    parts = [m.content for m in ordered if m.content]
+    parts = [f"# {m.name}\n{m.content}" for m in ordered if m.content]
     return "\n\n".join(parts)
 
 
-def build_system_prompt(instructions: str = "", memory: str = "") -> str:
+def build_system_prompt(instructions: str = "", memory: str = "", skill_catalog: str = "") -> str:
     """装配稳定系统提示：固定模块 + 可选槽（空槽跳过，不留多余空行）（F1/F43）。
 
     `instructions` 为项目指令文本（priority 80）、`memory` 为长期记忆索引
     （priority 100）；两者为空时行为与 ch08 完全一致。
     """
-    return assemble_system(fixed_modules() + optional_modules(instructions, memory))
+    return assemble_system(fixed_modules() + optional_modules(instructions, memory, skill_catalog))
 
 
 # ASCII PotatoCode
@@ -64,20 +61,17 @@ def render_banner(version: str, cwd: str) -> str:
 
 
 __all__ = [
-    "ActiveSkillEntry",
     "BANNER",
     "Environment",
     "EXECUTE_DIRECTIVE",
     "Module",
     "SkillCatalogItem",
     "assemble_system",
-    "build_environment_context",
     "build_system_prompt",
     "fixed_modules",
     "gather_environment",
     "optional_modules",
     "plan_reminder",
-    "render_active_skills_block",
     "render_banner",
     "render_skills_catalog",
     "system_reminder",

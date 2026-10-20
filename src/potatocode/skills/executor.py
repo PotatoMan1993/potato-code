@@ -1,8 +1,10 @@
-"""Skill 执行器：inline 钉 SOP 到环境上下文，fork 隔离子 Agent 执行后回流（ch13 F6/F7）。
+"""Skill 执行器：fork 隔离子 Agent 执行后回流（ch13 F7）。
 
-显式调用（斜杠命令）与意图识别（LoadSkill 工具只走激活，不执行）共用本执行器。
-fork 路径对宿主（TUI App）的依赖经 `SkillHost` 窄协议在执行期注入，skills 包不反向
-依赖 TUI；对 Agent 类的引用用局部 import，避免 agent ↔ skills 循环依赖（spec 5）。
+inline skill 不经执行器：斜杠命令把 SOP 作为 user 消息注入，LoadSkill 工具把
+SOP 作为 toolResult 返回。执行器只负责 fork 路径（execute_fork 同步取结果 /
+spawn_fork 后台启动回流）。fork 对宿主（TUI App）的依赖经 `SkillHost` 窄协议
+在执行期注入，skills 包不反向依赖 TUI；对 Agent 类的引用用局部 import，避免
+agent ↔ skills 循环依赖（spec 5）。
 """
 
 from __future__ import annotations
@@ -76,6 +78,10 @@ class SkillHost(Protocol):
         """工作目录（fork 运行时构造入参）。"""
         ...
 
+    def skill_deliver_result(self, text: str) -> None:
+        """fork 结果回流主对话（回合进行中由宿主暂存，回合收尾再补写）。"""
+        ...
+
 
 class SkillExecutor:
     """Skill 执行器本体：inline / fork 两条路径。
@@ -93,17 +99,30 @@ class SkillExecutor:
         self._fork_tasks.add(task)
         task.add_done_callback(self._fork_tasks.discard)
 
-    def execute_inline(self, skill: SkillDef, args: str, host: SkillHost) -> None:
-        """inline 执行（F6）：渲染 SOP → agent.activate_skill 钉到 env context。
+    def spawn_fork(self, skill: SkillDef, args: str, host: SkillHost) -> asyncio.Task:
+        """后台启动 fork 子 Agent（不阻塞调用方）：结果经 host.skill_deliver_result 回流。
 
-        不发起 LLM 请求；由 command handler 随后 inject_and_send 一条触发消息开跑
-        Agent loop——主循环每轮迭代重建 environment 时都会带上已钉的 SOP。
+        斜杠命令（Kind.UI）与 LoadSkill 工具的 fork 分支共用本入口；工具侧因此
+        免受 30s 工具超时约束。返回后台任务供测试等待，任务引用已登记防被 GC。
         """
-        agent = host.skill_agent()
-        if agent is None:
-            raise RuntimeError("尚未选定 provider，无法激活 skill")
-        rendered_body = substitute_arguments(skill.prompt_body, args)
-        agent.activate_skill(skill.name, rendered_body)
+        task = asyncio.create_task(self._run_fork_background(skill, args, host))
+        self.track_fork_task(task)
+        return task
+
+    async def _run_fork_background(self, skill: SkillDef, args: str, host: SkillHost) -> None:
+        """跑完 fork 子 Agent 并把最终文本回流宿主；异常兜底成错误文本（F7）。
+
+        execute_fork 内部已把执行异常包成错误文本；这里再兜一层防御，回流路径
+        自身出错时也给出可读提示。
+        """
+        try:
+            final_text = await self.execute_fork(skill, args, host)
+        except Exception as fork_error:  # 防御：回流路径自身出错时给出可读提示
+            logger.exception("fork skill '%s' 异常", skill.name)
+            final_text = (
+                f"[skill '{skill.name}' fork 失败: {type(fork_error).__name__}: {fork_error}]"
+            )
+        host.skill_deliver_result(final_text)
 
     async def execute_fork(self, skill: SkillDef, args: str, host: SkillHost) -> str:
         """fork 执行（F7/T5）：独立 Conversation + 临时 Agent，跑完后回流最终文本。

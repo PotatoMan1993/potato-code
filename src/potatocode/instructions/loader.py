@@ -74,7 +74,7 @@ class Loader:
         potatocode_dir = os.path.join(root, ".potatocode")
         return [
             (os.path.join(root, "POTATOCODE.md"), root),
-            (os.path.join(potatocode_dir, "POTATOCODE.md"), root),
+            (os.path.join(potatocode_dir, "POTATOCODE.md"), potatocode_dir),
             (
                 os.path.join(self.user_home, ".potatocode", "POTATOCODE.md"),
                 os.path.join(self.user_home, ".potatocode"),

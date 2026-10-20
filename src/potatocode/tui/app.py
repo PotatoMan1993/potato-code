@@ -260,8 +260,10 @@ class PotatoCodeApp(CompletionMixin, CommandMixin, StreamMixin, App):
                 cmd_reg, skill_loader, on_reload=self.rebind_skill_commands
             )
         if load_skill_tool is not None:
-            # 注入 getter：Agent 惰性构造 / 换 provider 重建后引用依然有效
+            # 注入 getter：Agent 惰性构造 / 换 provider 重建后引用依然有效；
+            # host 注入 self（App 实现 SkillHost 窄协议，fork 结果经此回流）
             load_skill_tool.set_agent(self.ensure_agent)
+            load_skill_tool.set_host(self)
         self.cmd_registry: CommandRegistry = cmd_reg
         self.completion = CompletionMenu()
         self.engine = engine  # 权限引擎（前四层），模式切换只影响后续兜底裁决
