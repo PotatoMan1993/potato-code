@@ -25,6 +25,10 @@ from ..command.skill_register import register_skill_commands
 from ..compact import sessions_root
 from ..config import ProviderConfig, effective_context_window
 from ..conversation import Conversation
+from ..hook import Engine as HookEngine
+from ..hook import Event as HookEvent
+from ..hook import Payload as HookPayload
+from ..hook import Rule as HookRule
 from ..llm import Provider, ToolDefinition, new_provider
 from ..mcp import Manager
 from ..memory import Manager as MemoryManager
@@ -44,6 +48,7 @@ from .stream import StreamMixin
 from .view import (
     SessionState,
     ToolDisplay,
+    error_notice_block,
     notice_block,
     statusbar_content,
     user_block,
@@ -237,6 +242,7 @@ class PotatoCodeApp(CompletionMixin, CommandMixin, StreamMixin, App):
         skill_executor: SkillExecutor | None = None,
         load_skill_tool: LoadSkill | None = None,
         skill_catalog_text: str = "",
+        hook_engine: HookEngine | None = None,
     ) -> None:
         super().__init__()
         self.providers = providers
@@ -267,6 +273,7 @@ class PotatoCodeApp(CompletionMixin, CommandMixin, StreamMixin, App):
         self.cmd_registry: CommandRegistry = cmd_reg
         self.completion = CompletionMenu()
         self.engine = engine  # 权限引擎（前四层），模式切换只影响后续兜底裁决
+        self.hook_engine = hook_engine  # ch14 Hook 引擎：生命周期事件分派（未注入时无 hook）
         self.manager = manager  # mcp manager
         self.provider: Provider | None = None
         # 跨轮持有的长生命周期状态：压缩账本、文件追踪、熔断计数、用量锚点
@@ -285,6 +292,8 @@ class PotatoCodeApp(CompletionMixin, CommandMixin, StreamMixin, App):
         self.cur_reply = ""
         self.turn_start = 0.0
         self.mode: Mode = engine.start_mode()  # 当前权限模式，Shift+Tab /plan /do 切换，跨轮保持
+        # ch14：hook 引擎同时挂在 runtime 上（reset_for_new_session 重置 only_once 用）
+        self.runtime.hook_engine = self.hook_engine
         self.iter = 0  # 当前迭代轮次（进度显示，F9）
         self.usage_in = 0  # 会话累计输入 token（F8）
         self.usage_out = 0  # 会话累计输出 token（F8）
@@ -318,8 +327,11 @@ class PotatoCodeApp(CompletionMixin, CommandMixin, StreamMixin, App):
             yield ResumeSelect(id="resume-list")
         yield Static(id="statusbar")
 
-    def on_mount(self) -> None:
-        """启动：写 banner；单 provider 直进对话，多 provider 进选择界面。"""
+    async def on_mount(self) -> None:
+        """启动：写 banner；单 provider 直进对话，多 provider 进选择界面。
+
+        ch14：末尾派发 SessionStart——env context 装配完毕、首条 user 消息进入之前（F9）。
+        """
         log = self.query_one("#log", RichLog)
         title = Text()
         title.append(render_banner(self._version, os.getcwd()), style="cyan")
@@ -335,6 +347,7 @@ class PotatoCodeApp(CompletionMixin, CommandMixin, StreamMixin, App):
             self._activate_provider(self.providers[0])
         else:
             self._enter_selecting()
+        await self._dispatch_session_start()
 
     # ────────────────────── 状态切换 ──────────────────────
 
@@ -390,8 +403,56 @@ class PotatoCodeApp(CompletionMixin, CommandMixin, StreamMixin, App):
             instruction_text=self._instruction_text,
             memory_text=self._memory_text,
             skill_catalog=self._skill_catalog_text,
+            hook_engine=self.hook_engine,
         )
         return self.agent
+
+    # ────────────────── ch14 Hook：生命周期事件派发（TUI 侧 5 个事件） ──────────────────
+
+    def _hook_base_payload(self, event: HookEvent) -> HookPayload:
+        """hook payload 的通用字段（ch14 F10）；TUI 侧事件由这里构造。"""
+        return {
+            "event": event.value,
+            "session_id": self.runtime.session.session_id,
+            "cwd": self.workspace,
+            "mode": self.mode.name.lower(),
+        }
+
+    async def _dispatch_session_start(self) -> None:
+        """SessionStart：启动 / /clear 新会话后派发；注入 prompt 进 reminder 队列（F9/F33）。"""
+        if self.hook_engine is None:
+            return
+        result = await self.hook_engine.dispatch(
+            HookEvent.SESSION_START, self._hook_base_payload(HookEvent.SESSION_START)
+        )
+        if result.injected_prompts:
+            self.runtime.append_reminders(result.injected_prompts)
+
+    async def _dispatch_session_end(self) -> None:
+        """SessionEnd：/clear、/resume 离开旧会话前派发（F9）。"""
+        if self.hook_engine is None:
+            return
+        await self.hook_engine.dispatch(
+            HookEvent.SESSION_END, self._hook_base_payload(HookEvent.SESSION_END)
+        )
+
+    async def _dispatch_session_resume(self) -> None:
+        """SessionResume：/resume 恢复完成后、首条 user 消息进入之前派发（F9）。"""
+        if self.hook_engine is None:
+            return
+        result = await self.hook_engine.dispatch(
+            HookEvent.SESSION_RESUME, self._hook_base_payload(HookEvent.SESSION_RESUME)
+        )
+        if result.injected_prompts:
+            self.runtime.append_reminders(result.injected_prompts)
+
+    def hook_rules(self) -> list[HookRule]:
+        """/hooks 查询：已加载 hook 规则列表（未注入引擎时为空，ch14 F34）。"""
+        return self.hook_engine.rules if self.hook_engine is not None else []
+
+    def hook_sources(self) -> list[str]:
+        """/hooks 查询：hook 配置加载来源文件列表（ch14 F34）。"""
+        return self.hook_engine.sources if self.hook_engine is not None else []
 
     # ────────────────────── 会话恢复（ch11） ──────────────────────
 
@@ -499,6 +560,24 @@ class PotatoCodeApp(CompletionMixin, CommandMixin, StreamMixin, App):
         if self.state is not SessionState.IDLE or self.provider is None:
             # 流式期间 / 未选定 provider：不接受新提交（保留已输入内容）
             return
+
+        # ch14 UserPromptSubmit：写入对话历史之前派发，可拦截（F9/G6/F32）
+        if self.hook_engine is not None:
+            submit_result = await self.hook_engine.dispatch(
+                HookEvent.USER_PROMPT_SUBMIT,
+                self._hook_base_payload(HookEvent.USER_PROMPT_SUBMIT) | {"prompt": text},
+            )
+            if submit_result.blocked:
+                # 拦截：错误块显示拒绝原因，输入框内容保留等用户重新编辑（F32）
+                self.query_one("#log", RichLog).write(
+                    error_notice_block(
+                        f"[hook {submit_result.blocking_hook_name}] {submit_result.reason}"
+                    )
+                )
+                self.query_one(ChatTextArea).focus()
+                return
+            if submit_result.injected_prompts:
+                self.runtime.append_reminders(submit_result.injected_prompts)
 
         input_box.clear()
         self.conv.add_user(text)

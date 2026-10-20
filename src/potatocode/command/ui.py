@@ -65,7 +65,18 @@ class UI(Protocol):
 
     def open_resume_menu(self) -> None: ...
 
-    def clear_and_new_session(self) -> None: ...
+    async def clear_and_new_session(self) -> None:
+        """结束当前会话并开启新会话（ch14：改为 async，串接 SessionEnd/SessionStart 派发）。"""
+        ...
+
+    # ── Hook 查询（ch14 /hooks 命令） ──
+    def hook_rules(self) -> list:
+        """已加载的 hook 规则列表（未注入 hook 引擎时为空列表）。"""
+        ...
+
+    def hook_sources(self) -> list[str]:
+        """hook 配置的加载来源文件路径列表。"""
+        ...
 
     # ── Skill 支持（ch13） ──
     def current_agent(self) -> Agent | None:
@@ -138,8 +149,14 @@ class NopUI:
     def open_resume_menu(self) -> None:
         pass
 
-    def clear_and_new_session(self) -> None:
+    async def clear_and_new_session(self) -> None:
         pass
+
+    def hook_rules(self) -> list:
+        return []
+
+    def hook_sources(self) -> list[str]:
+        return []
 
     def current_agent(self) -> Agent | None:
         return None

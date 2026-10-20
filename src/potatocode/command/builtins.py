@@ -19,7 +19,7 @@ from .registry import Registry
 
 
 def register_builtins(reg: Registry) -> None:
-    """把 12 条内置命令按名字注册进 reg；/help 的 handler 工厂捕获 reg 自身。"""
+    """把内置命令按名字注册进 reg；/help 的 handler 工厂捕获 reg 自身。"""
     reg.register(
         Command(
             name="clear",
@@ -58,6 +58,17 @@ def register_builtins(reg: Registry) -> None:
             description="显示所有可用命令",
             kind=Kind.LOCAL,
             handler=make_help_handler(reg),
+        )
+    )
+    # ch14 T21：/hooks 列出已加载 hook（KindLocal，零参数，任何状态可执行）
+    from ..tui.hooks import handle_hooks
+
+    reg.register(
+        Command(
+            name="hooks",
+            description="列出已加载的 hook 列表",
+            kind=Kind.LOCAL,
+            handler=handle_hooks,
         )
     )
     reg.register(

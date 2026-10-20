@@ -11,7 +11,7 @@ from pathlib import Path
 
 from ..llm import ToolCall
 from .blacklist import _BLACKLIST, hits_blacklist
-from .rule import Rule, RuleSet, match_pattern
+from .rule import Rule, RuleSet, match_pattern, match_rule
 from .sandbox import relpath_for, resolve_root, sandbox_ok
 from .settings import (
     Settings,
@@ -101,26 +101,26 @@ class Engine:
         return Decision.ALLOW, ""
 
     def _match_rules(self, friendly: str, target: str) -> tuple[Decision, Rule | None]:
-        """跨三层匹配规则（F4/AC5）：deny 全层优先、allow 随后，层级先后不影响结果。"""
+        """跨三层匹配规则（F4/AC5）：deny 全层优先、allow 随后，层级先后不影响结果。
+
+        工具名沿用 ch08 的 glob 整串匹配；目标串交给规则的 matcher
+        （ch14 扩展后支持 =精确 / ~正则 / !反向 / 缺省 glob）。
+        """
         for ruleset in (self.local, self.project, self.user):
             for rule in ruleset.deny:
-                if match_pattern(rule.tool, friendly, path=False) and match_pattern(
-                    rule.pattern, target
-                ):
+                if match_pattern(rule.tool, friendly, path=False) and match_rule(rule, target):
                     return Decision.DENY, rule
         for ruleset in (self.local, self.project, self.user):
             for rule in ruleset.allow:
-                if match_pattern(rule.tool, friendly, path=False) and match_pattern(
-                    rule.pattern, target
-                ):
+                if match_pattern(rule.tool, friendly, path=False) and match_rule(rule, target):
                     return Decision.ALLOW, rule
         return Decision.ALLOW, None
 
 
 def _deny_rule_reason(rule) -> str:
-    """deny 规则命中的原因文案（含 Tool(pattern) 供模型/用户阅读）。"""
-    if rule.pattern:
-        return f"匹配 deny 规则：{rule.tool}({rule.pattern})"
+    """deny 规则命中的原因文案（含 Tool(raw) 供模型/用户阅读；ch14 用原始描述串）。"""
+    if rule.raw:
+        return f"匹配 deny 规则：{rule.tool}({rule.raw})"
     return f"匹配 deny 规则：{rule.tool}"
 
 

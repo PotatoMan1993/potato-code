@@ -31,6 +31,10 @@ from ..compact import (
     usage_anchor,
 )
 from ..conversation import Conversation
+from ..hook import DispatchResult as HookDispatchResult
+from ..hook import Engine as HookEngine
+from ..hook import Event as HookEvent
+from ..hook import Payload as HookPayload
 from ..llm import (
     ROLE_ASSISTANT,
     ROLE_USER,
@@ -177,6 +181,41 @@ def recent_turn(msgs: list[Message]) -> list[Message]:
     return []
 
 
+def _last_user_prompt(conv: Conversation) -> str:
+    """取对话末尾最近一条 user 消息的文本（PreUserMessage payload 用，ch14 F10）。"""
+    for msg in reversed(conv.messages()):
+        if msg.role == ROLE_USER:
+            return msg.content
+    return ""
+
+
+def _tool_input_dict(call: ToolCall) -> dict:
+    """把工具调用的 JSON 参数解析为 dict；解析失败返回空 dict（hook payload 用）。"""
+    try:
+        data = json.loads(call.input) if call.input else {}
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+# PostToolUse payload 里工具结果摘要的上限（过长结果只保留前缀，ch14 F10）
+_TOOL_RESULT_SUMMARY_LIMIT = 2000
+
+
+def _result_summary(content: str) -> str:
+    """工具结果摘要文本（PostToolUse payload 用；超长截断）。"""
+    if len(content) <= _TOOL_RESULT_SUMMARY_LIMIT:
+        return content
+    return content[:_TOOL_RESULT_SUMMARY_LIMIT] + "…"
+
+
+def _hook_blocked_result(call_id: str, hook_name: str, reason: str) -> ToolResult:
+    """hook 拦截的 tool_result（ch14 F32）：`[hook <name>] <reason>` 且 is_error=True。"""
+    return ToolResult(
+        tool_call_id=call_id, content=f"[hook {hook_name}] {reason}", is_error=True
+    )
+
+
 def has_memory_signal(msgs: list[Message]) -> bool:
     """本轮用户消息是否包含显式记忆请求关键词（F35-②）。"""
     for msg in msgs:
@@ -216,6 +255,7 @@ class Agent:
         instruction_text: str = "",
         memory_text: str = "",
         skill_catalog: str = "",
+        hook_engine: HookEngine | None = None,
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -223,6 +263,10 @@ class Agent:
         self.engine = engine  # 权限引擎：前四层判定，实际运行由 cli/tui 注入
         # 长生命周期状态由 TUI 跨轮持有；未注入时自建一份（测试与脚本场景）
         self.runtime = runtime if runtime is not None else new_runtime()
+        # ch14 Hook 引擎：11 个生命周期时刻的事件分派；未注入时全部 emit 为空操作
+        self._hook_engine = hook_engine
+        # cwd（hook payload 通用字段）：以运行时记录的项目工作目录为准
+        self._workspace = self.runtime.workspace or str(Path.cwd())
         # 用 asyncio.Lock 保证 run 与 run_force_compact 不并发触发上下文管理
         self._run_lock = asyncio.Lock()
         # 项目指令与长期记忆：启动时加载一次，之后每轮请求组装时注入系统提示
@@ -238,6 +282,48 @@ class Agent:
     def set_skill_catalog(self, catalog: str) -> None:
         """更新 Available Skills 目录文本（启动期注入，reload / 安装后刷新，F11）。"""
         self._skill_catalog = catalog
+
+    # ────────────────── ch14 Hook：事件分派与 reminder 装配 ──────────────────
+
+    def _base_hook_payload(self, event: HookEvent, mode: Mode | None = None) -> HookPayload:
+        """构造 hook payload 的通用字段（ch14 F10）：event/session_id/cwd/mode。"""
+        payload: HookPayload = {
+            "event": event.value,
+            "session_id": self.runtime.session.session_id,
+            "cwd": self._workspace,
+        }
+        if mode is not None:
+            payload["mode"] = mode.name.lower()
+        return payload
+
+    async def _dispatch_hook(
+        self, event: HookEvent, payload: HookPayload
+    ) -> HookDispatchResult:
+        """把一个生命周期事件交给 hook 引擎分派；未注入引擎时返回空结果（ch14 F31）。
+
+        分派产生的注入 prompt 统一进 runtime 的 reminder 队列，由下一次
+        `_build_reminder` 取出拼进请求；返回结果保留拦截判定供 PreToolUse 用。
+        """
+        if self._hook_engine is None:
+            return HookDispatchResult()
+        result = await self._hook_engine.dispatch(event, payload)
+        if result.injected_prompts:
+            self.runtime.append_reminders(result.injected_prompts)
+        return result
+
+    def _build_reminder(self, mode: Mode, iteration: int) -> str:
+        """装配本轮请求的 reminder 串：plan reminder 在前，hook 注入按声明序随后（ch14 F20/F33）。
+
+        hook 注入只在本轮有效——取出即清空队列；不入持久历史、不影响压缩（ch14 F21/N4）。
+        """
+        parts: list[str] = []
+        if mode == Mode.PLAN:
+            full = iteration == 1 or (iteration - 1) % PLAN_REMINDER_INTERVAL == 0
+            parts.append(prompt.plan_reminder(full))
+        pending_reminders = self.runtime.take_reminders()
+        if pending_reminders:
+            parts.append("\n\n".join(pending_reminders))
+        return "\n\n".join(parts)
 
     async def run(
         self,
@@ -262,11 +348,26 @@ class Agent:
         """手动 `/compact` 入口：跳过阈值与熔断，无条件做一次摘要。
 
         与 `run` 互斥；返回压缩前后的估算 token，失败时异常向上抛由调用方展示。
+        ch14：手动路径同样 emit PreCompact / PostCompact（F9 三路径合并）。
         """
         async with self._run_lock:
             defs = self._registry.definitions() if tool_defs is None else tool_defs
             in_ = self._manage_input(conv, defs, TriggerKind.MANUAL)
+            await self._dispatch_hook(
+                HookEvent.PRE_COMPACT,
+                self._base_hook_payload(HookEvent.PRE_COMPACT)
+                | {"trigger": TriggerKind.MANUAL.value},
+            )
             out = await manage_context(in_)
+            await self._dispatch_hook(
+                HookEvent.POST_COMPACT,
+                self._base_hook_payload(HookEvent.POST_COMPACT)
+                | {
+                    "trigger": TriggerKind.MANUAL.value,
+                    "before_tokens": out.before_tokens,
+                    "after_tokens": out.after_tokens,
+                },
+            )
             return out.before_tokens, out.after_tokens
 
     def _manage_input(
@@ -302,7 +403,9 @@ class Agent:
     ) -> AsyncIterator[Event]:
         """ReAct 主循环本体：每轮先管理上下文，再请求、执行工具、回灌结果。"""
         # 每次 run 起始装配稳定系统提示（普通/规划一致；规划提醒已移出系统通道）
-        sys = prompt.build_system_prompt(self._instruction_text, self._memory_text, self._skill_catalog)
+        sys = prompt.build_system_prompt(
+            self._instruction_text, self._memory_text, self._skill_catalog
+        )
         if mode == Mode.PLAN:
             defs = self._registry.read_only_definitions()
         else:
@@ -317,11 +420,9 @@ class Agent:
                 self._finish_cancelled(conv)
                 return
 
-            # 规划模式按轮次注入 reminder：首轮完整、间隔轮完整、其余精简（F7）
-            reminder = ""
-            if mode == Mode.PLAN:
-                full = it == 1 or (it - 1) % PLAN_REMINDER_INTERVAL == 0
-                reminder = prompt.plan_reminder(full)
+            # 规划模式按轮次注入 reminder：首轮完整、间隔轮完整、其余精简（F7）；
+            # ch14：reminder 装配挪到 _stream_once 内、PreUserMessage 派发之后——
+            # 该时刻触发的 hook 注入要进「下一次（即本轮）LLM 请求」（F20/F33）
 
             # —— 请求本轮之前先管理上下文：第 1 层必跑，必要时触发第 2 层摘要 ——
             in_ = self._manage_input(conv, defs, TriggerKind.AUTO)
@@ -330,12 +431,28 @@ class Agent:
             )
             if will_summarize:  # 只跑第 1 层是静默操作，不发压缩事件
                 yield Event(compact=CompactEvent(phase=CompactPhase.BEFORE_AUTO))
+            # ch14 PreCompact：manage_context 调用之前（自动路径，F9）
+            await self._dispatch_hook(
+                HookEvent.PRE_COMPACT,
+                self._base_hook_payload(HookEvent.PRE_COMPACT, mode)
+                | {"trigger": TriggerKind.AUTO.value},
+            )
             out = ManageOutput(before_tokens=in_.estimated_token, after_tokens=in_.estimated_token)
             mc_err: Exception | None = None
             try:
                 out = await manage_context(in_)
             except Exception as e:
                 mc_err = e
+            # ch14 PostCompact：manage_context 返回后（ch14 F9）
+            await self._dispatch_hook(
+                HookEvent.POST_COMPACT,
+                self._base_hook_payload(HookEvent.POST_COMPACT, mode)
+                | {
+                    "trigger": TriggerKind.AUTO.value,
+                    "before_tokens": out.before_tokens,
+                    "after_tokens": out.after_tokens,
+                },
+            )
             if will_summarize:
                 yield Event(
                     compact=CompactEvent(
@@ -347,6 +464,11 @@ class Agent:
                 )
             if mc_err is not None:
                 _ensure_assistant_tail(conv, NOTICE_STREAM_ERR)
+                await self._dispatch_hook(
+                    HookEvent.NOTIFICATION,
+                    self._base_hook_payload(HookEvent.NOTIFICATION, mode)
+                    | {"kind": "stream_error", "detail": str(mc_err)},
+                )
                 yield Event(err=mc_err)
                 return
 
@@ -354,7 +476,7 @@ class Agent:
             emergency_retried = False
             while True:  # 撞墙重试环路：正常路径只跑一次
                 outcome = _StreamOutcome()
-                async for item in self._stream_once(conv, defs, sys, env_text, reminder, cancel):
+                async for item in self._stream_once(conv, defs, sys, env_text, cancel, mode, it):
                     if isinstance(item, _StreamOutcome):
                         outcome = item
                     else:
@@ -376,6 +498,12 @@ class Agent:
                 if isinstance(err, PromptTooLongError) and not emergency_retried:
                     # 撞上下文墙：先做一次紧急压缩，再用新消息列表重试本请求一次
                     yield Event(compact=CompactEvent(phase=CompactPhase.BEFORE_EMERGENCY))
+                    # ch14 PreCompact：紧急路径同样在 manage_context 之前（F9 三路径合并）
+                    await self._dispatch_hook(
+                        HookEvent.PRE_COMPACT,
+                        self._base_hook_payload(HookEvent.PRE_COMPACT, mode)
+                        | {"trigger": TriggerKind.EMERGENCY.value},
+                    )
                     emg = self._manage_input(conv, defs, TriggerKind.EMERGENCY)
                     emg_out = ManageOutput(before_tokens=0, after_tokens=0)
                     emg_err: Exception | None = None
@@ -383,6 +511,16 @@ class Agent:
                         emg_out = await manage_context(emg)
                     except Exception as e:
                         emg_err = e
+                    # ch14 PostCompact：紧急路径 manage_context 返回后（F9）
+                    await self._dispatch_hook(
+                        HookEvent.POST_COMPACT,
+                        self._base_hook_payload(HookEvent.POST_COMPACT, mode)
+                        | {
+                            "trigger": TriggerKind.EMERGENCY.value,
+                            "before_tokens": emg_out.before_tokens,
+                            "after_tokens": emg_out.after_tokens,
+                        },
+                    )
                     yield Event(
                         compact=CompactEvent(
                             phase=CompactPhase.AFTER_EMERGENCY,
@@ -393,6 +531,11 @@ class Agent:
                     )
                     if emg_err is not None:
                         _ensure_assistant_tail(conv, NOTICE_STREAM_ERR)
+                        await self._dispatch_hook(
+                            HookEvent.NOTIFICATION,
+                            self._base_hook_payload(HookEvent.NOTIFICATION, mode)
+                            | {"kind": "stream_error", "detail": str(emg_err)},
+                        )
                         yield Event(err=emg_err)
                         return
                     # 会话已被重建：锚点清零后用新消息序列重新估算
@@ -417,6 +560,12 @@ class Agent:
                     # 顺序关键：消费者见到 err 即收尾本轮，收尾后不能再有遗留动作。
                     _ensure_assistant_tail(conv, NOTICE_STREAM_ERR)
                     if outcome.err is not None:
+                        # ch14 Notification：Stream 返回 Err 时（F9）
+                        await self._dispatch_hook(
+                            HookEvent.NOTIFICATION,
+                            self._base_hook_payload(HookEvent.NOTIFICATION, mode)
+                            | {"kind": "stream_error", "detail": str(outcome.err)},
+                        )
                         yield Event(err=outcome.err)
                 return
 
@@ -438,6 +587,11 @@ class Agent:
                     yield Event(text=final)
                 conv.add_assistant(final)
                 self._maybe_update_memory(conv)  # 每 5 轮 / 显式请求时异步提炼记忆
+                # ch14 Stop：自然停止后、Done 事件 emit 之前（F9；取消/出错不触发）
+                await self._dispatch_hook(
+                    HookEvent.STOP,
+                    self._base_hook_payload(HookEvent.STOP, mode) | {"iter": it},
+                )
                 yield Event(done=True)
                 return
 
@@ -475,12 +629,22 @@ class Agent:
             if unknown_run >= MAX_UNKNOWN_RUN:
                 yield Event(notice=NOTICE_UNKNOWN_TOOLS)
                 _ensure_assistant_tail(conv, NOTICE_UNKNOWN_TOOLS)
+                # ch14 Stop：连续未知工具也是自然停止路径（非取消/出错，F9）
+                await self._dispatch_hook(
+                    HookEvent.STOP,
+                    self._base_hook_payload(HookEvent.STOP, mode) | {"iter": it},
+                )
                 yield Event(done=True)
                 return
 
         # 循环走完：触达迭代上限（F2-2）
         yield Event(notice=NOTICE_MAX_ITER)
         _ensure_assistant_tail(conv, NOTICE_MAX_ITER)
+        # ch14 Stop：迭代上限同样是自然停止路径（F9）
+        await self._dispatch_hook(
+            HookEvent.STOP,
+            self._base_hook_payload(HookEvent.STOP, mode) | {"iter": MAX_ITERATIONS},
+        )
         yield Event(done=True)
 
     async def _stream_once(
@@ -489,12 +653,15 @@ class Agent:
         defs: list[ToolDefinition],
         sys: str,
         env_text: str,
-        reminder: str,
         cancel: asyncio.Event,
+        mode: Mode,
+        iteration: int,
     ) -> AsyncIterator[Event | _StreamOutcome]:
         """发起一次请求：转发文本增量事件，累积完整文本与工具调用，记录本轮用量。
 
-        组装 `llm.Request`（稳定系统提示 + 环境段 + 本轮 reminder）发起请求；
+        请求前先派发 PreUserMessage（ch14 F9），随后装配 reminder 串
+        （plan reminder 在前 + hook 注入随后，ch14 F20/F33）并组装 `llm.Request`
+        （稳定系统提示 + 环境段 + reminder）发起请求；
         最后 yield `_StreamOutcome`；ok=False 表示流出错或已取消
         （出错时异常随 outcome.err 带回，由 run 收尾历史后再上抛）。
         双路收集：文本增量实时推给事件流，完整响应（含拼齐 JSON 参数的工具调用）
@@ -503,6 +670,15 @@ class Agent:
         if cancel.is_set():
             yield _StreamOutcome(ok=False)
             return
+
+        # ch14 PreUserMessage：调 provider.stream 之前，payload 带末尾 user 消息（F9）
+        await self._dispatch_hook(
+            HookEvent.PRE_USER_MESSAGE,
+            self._base_hook_payload(HookEvent.PRE_USER_MESSAGE, mode)
+            | {"prompt": _last_user_prompt(conv)},
+        )
+        # ch14 F20/F33：hook 注入的 prompt 队列在 plan reminder 之后拼进同一串
+        reminder = self._build_reminder(mode, iteration)
 
         text_parts: list[str] = []
         calls: list[ToolCall] = []
@@ -577,6 +753,22 @@ class Agent:
                             phase=Phase.START,
                         )
                     )
+                    # ch14 PreToolUse：权限引擎 check 之前，拦截则跳过权限与执行（F9/G6）
+                    hook_result = await self._dispatch_hook(
+                        HookEvent.PRE_TOOL_USE,
+                        self._base_hook_payload(HookEvent.PRE_TOOL_USE, mode)
+                        | {
+                            "tool_name": calls[k].name,
+                            "tool_input": _tool_input_dict(calls[k]),
+                        },
+                    )
+                    if hook_result.blocked:
+                        results[k] = _hook_blocked_result(
+                            calls[k].id,
+                            hook_result.blocking_hook_name,
+                            hook_result.reason,
+                        )
+                        continue  # PhaseEnd 按当前实现继续 emit，is_error=True（F32）
                     decision, reason = self.engine.check(mode, calls[k], True)
                     if decision is Decision.DENY:
                         results[k] = ToolResult(
@@ -590,6 +782,17 @@ class Agent:
                 for k in range(i, j):  # 按模型输出的工具顺序显示工具执行结果
                     r = results[k]
                     assert r is not None  # 每个下标都被 Deny 预置或 _run_batch 填充
+                    # ch14 PostToolUse：拿到 result 之后、PhaseEnd emit 之前（F9）
+                    await self._dispatch_hook(
+                        HookEvent.POST_TOOL_USE,
+                        self._base_hook_payload(HookEvent.POST_TOOL_USE, mode)
+                        | {
+                            "tool_name": calls[k].name,
+                            "tool_input": _tool_input_dict(calls[k]),
+                            "tool_result": _result_summary(r.content),
+                            "is_error": r.is_error,
+                        },
+                    )
                     yield Event(
                         tool=ToolEvent(
                             name=calls[k].name,
@@ -610,41 +813,78 @@ class Agent:
                         phase=Phase.START,
                     )
                 )
-                decision, reason = self.engine.check(mode, calls[k], False)
+                # ch14 PreToolUse：权限引擎 check 之前，拦截则跳过权限与执行（F9/G6）
+                hook_result = await self._dispatch_hook(
+                    HookEvent.PRE_TOOL_USE,
+                    self._base_hook_payload(HookEvent.PRE_TOOL_USE, mode)
+                    | {
+                        "tool_name": calls[k].name,
+                        "tool_input": _tool_input_dict(calls[k]),
+                    },
+                )
 
-                if decision is Decision.ALLOW:
-                    completed = await self._run_batch(calls, [k], results, cancel)
-                elif decision is Decision.DENY:
-                    results[k] = ToolResult(tool_call_id=calls[k].id, content=reason, is_error=True)
+                if hook_result.blocked:
+                    results[k] = _hook_blocked_result(
+                        calls[k].id, hook_result.blocking_hook_name, hook_result.reason
+                    )
                     completed = True
                 else:
-                    # 第五层人在回路（F8）：发事件 → await 用户决策
-                    respond: asyncio.Future[Outcome] = asyncio.get_running_loop().create_future()
-                    yield Event(
-                        approval=ApprovalRequest(
-                            name=calls[k].name,
-                            args=_preview(calls[k].input),
-                            reason=reason,
-                            respond=respond,
-                        )
-                    )
-                    outcome = await respond
-                    if outcome is Outcome.ALLOW_FOREVER:
-                        try:
-                            self.engine.persist_local_allow(calls[k])
-                        except Exception as e:  # 持久化失败不阻断执行
-                            logger.warning("写入本地规则失败: %s", e)
+                    decision, reason = self.engine.check(mode, calls[k], False)
+
+                    if decision is Decision.ALLOW:
                         completed = await self._run_batch(calls, [k], results, cancel)
-                    elif outcome is Outcome.ALLOW_ONCE:
-                        completed = await self._run_batch(calls, [k], results, cancel)
-                    else:  # DENY_ONCE
+                    elif decision is Decision.DENY:
                         results[k] = ToolResult(
                             tool_call_id=calls[k].id, content=reason, is_error=True
                         )
                         completed = True
+                    else:
+                        # 第五层人在回路（F8）：发事件 → await 用户决策
+                        # ch14 Notification：权限 Ask 弹出审批时（F9）
+                        await self._dispatch_hook(
+                            HookEvent.NOTIFICATION,
+                            self._base_hook_payload(HookEvent.NOTIFICATION, mode)
+                            | {"kind": "approval", "detail": calls[k].name},
+                        )
+                        respond: asyncio.Future[Outcome] = (
+                            asyncio.get_running_loop().create_future()
+                        )
+                        yield Event(
+                            approval=ApprovalRequest(
+                                name=calls[k].name,
+                                args=_preview(calls[k].input),
+                                reason=reason,
+                                respond=respond,
+                            )
+                        )
+                        outcome = await respond
+                        if outcome is Outcome.ALLOW_FOREVER:
+                            try:
+                                self.engine.persist_local_allow(calls[k])
+                            except Exception as e:  # 持久化失败不阻断执行
+                                logger.warning("写入本地规则失败: %s", e)
+                            completed = await self._run_batch(calls, [k], results, cancel)
+                        elif outcome is Outcome.ALLOW_ONCE:
+                            completed = await self._run_batch(calls, [k], results, cancel)
+                        else:  # DENY_ONCE
+                            results[k] = ToolResult(
+                                tool_call_id=calls[k].id, content=reason, is_error=True
+                            )
+                            completed = True
 
                 r = results[k]
                 assert r is not None
+                # ch14 PostToolUse：拿到 result 之后、PhaseEnd emit 之前（F9）
+                await self._dispatch_hook(
+                    HookEvent.POST_TOOL_USE,
+                    self._base_hook_payload(HookEvent.POST_TOOL_USE, mode)
+                    | {
+                        "tool_name": calls[k].name,
+                        "tool_input": _tool_input_dict(calls[k]),
+                        "tool_result": _result_summary(r.content),
+                        "is_error": r.is_error,
+                    },
+                )
                 yield Event(
                     tool=ToolEvent(
                         name=calls[k].name,

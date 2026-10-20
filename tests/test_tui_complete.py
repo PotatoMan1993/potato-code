@@ -37,11 +37,11 @@ def _new_app(tmp_path) -> PotatoCodeApp:
 
 
 def test_update_activates_on_slash():
-    """仅输入 "/" 时激活并返回全部 12 条候选（F24/AC11）。"""
+    """仅输入 "/" 时激活并返回全部 13 条候选（F24/AC11）。"""
     menu = CompletionMenu()
     menu.update("/", _reg())
     assert menu.active
-    assert len(menu.items) == 12
+    assert len(menu.items) == 13
     assert menu.selected() is not None
 
 
@@ -111,14 +111,14 @@ def test_selected_returns_highlighted_command():
 
 
 def test_render_lists_candidates_with_hint():
-    """渲染含候选行与滚动提示；12 条候选只显示 8 行 + ↓ 提示（F27/N5）。"""
+    """渲染含候选行与滚动提示；13 条候选只显示 8 行 + ↓ 提示（F27/N5）。"""
     menu = CompletionMenu()
     menu.update("/", _reg())
     text = menu.render(100)
     plain = text.plain
     for name in ("clear", "compact", "do", "exit"):
         assert f"/{name}" in plain
-    assert "↓ 4 more" in plain  # 12 - 8
+    assert "↓ 5 more" in plain  # 13 - 8
     assert plain.count("\n") <= 10  # 8 行候选 + 提示行，高度受限
 
 
@@ -155,7 +155,7 @@ async def test_app_menu_activates_filters_and_escapes(tmp_path):
         await pilot.press("/")
         await pilot.pause()
         assert app.completion.active
-        assert len(app.completion.items) == 12
+        assert len(app.completion.items) == 13
         assert app.query_one("#completion", Static).display
 
         await pilot.press("s")

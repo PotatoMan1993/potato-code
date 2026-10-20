@@ -67,11 +67,11 @@ async def test_mode_persists_and_rules_unchanged(tmp_path):
     """切换模式只改兜底裁决，不重置模式、不改已加载规则（AC9/F7）。"""
     app = _new_app(tmp_path)
     async with app.run_test() as pilot:
-        before = [r.pattern for r in app.engine.local.allow]
+        before = [r.raw for r in app.engine.local.allow]
         await pilot.press("shift+tab")
         assert app.mode is Mode.ACCEPT_EDITS  # 跨轮保持的基础：模式是持久字段
         # 切换不改已加载规则
-        assert [r.pattern for r in app.engine.local.allow] == before
+        assert [r.raw for r in app.engine.local.allow] == before
 
 
 # ────────── 状态栏（AC9/F7） ──────────

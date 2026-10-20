@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import yaml
 
 from ..llm import ToolCall
+from .matcher import GlobMatcher
 from .rule import Rule
 from .sandbox import relpath_for
 from .settings import SettingsError, extract_target, friendly_name, load_settings
@@ -30,20 +31,31 @@ def rule_for(engine: Engine, call: ToolCall) -> tuple[Rule, str, bool]:
 
     bash → `Bash(<escaped command>)`；文件类 → `Write/Read(...)(<relpath>)`；
     解析失败 / 未知 → (Rule("","",False), "", False)。
+    ch14：内存 Rule 改持结构化 matcher——bash 串经 escape_glob 后按命令整串
+    glob（与写盘串重新解析的语义一致），文件路径按路径分段 glob。
     """
     friendly = friendly_name(call.name)
     target, is_file, ok = extract_target(call)
     if not ok or not target:
-        return Rule("", "", False), "", False
+        return Rule("", None, False, ""), "", False
 
     if is_file:
         rel = relpath_for(engine.root, target)
         if not rel:
-            return Rule("", "", False), "", False
-        return Rule(friendly, rel, True), f"{friendly}({rel})", True
+            return Rule("", None, False, ""), "", False
+        rule = Rule(
+            tool=friendly, matcher=GlobMatcher(rel, is_command=False), allow=True, raw=rel
+        )
+        return rule, f"{friendly}({rel})", True
 
     escaped = escape_glob(target)
-    return Rule(friendly, escaped, True), f"{friendly}({escaped})", True
+    rule = Rule(
+        tool=friendly,
+        matcher=GlobMatcher(escaped, is_command=True),
+        allow=True,
+        raw=escaped,
+    )
+    return rule, f"{friendly}({escaped})", True
 
 
 def persist_local_allow(engine: Engine, call: ToolCall) -> None:

@@ -67,6 +67,8 @@ class CommandMixin:
     skill_loader: object  # SkillLoader | None
     skill_executor: object  # SkillExecutor | None
     _pending_fork_texts: list[str]
+    # ch14 Hook 引擎：由 cli 装配后传入（未注入时 hook 功能关闭）
+    hook_engine: object  # HookEngine | None
 
     if TYPE_CHECKING:
 
@@ -81,6 +83,12 @@ class CommandMixin:
         def current_defs(self) -> list: ...
 
         def ensure_agent(self) -> Agent | None: ...
+
+        async def _dispatch_session_start(self) -> None: ...
+
+        async def _dispatch_session_end(self) -> None: ...
+
+        async def _dispatch_session_resume(self) -> None: ...
 
         async def action_quit(self) -> None: ...
 
@@ -150,6 +158,16 @@ class CommandMixin:
 
     def idle(self) -> bool:
         return self.state is SessionState.IDLE
+
+    # ────────────────── UI Protocol：Hook 查询（ch14 T21） ──────────────────
+
+    def hook_rules(self) -> list:
+        """已加载 hook 规则列表（实现在 PotatoCodeApp；/hooks 命令用）。"""
+        return self.hook_engine.rules if self.hook_engine is not None else []
+
+    def hook_sources(self) -> list[str]:
+        """hook 配置加载来源文件列表（/hooks 命令用）。"""
+        return self.hook_engine.sources if self.hook_engine is not None else []
 
     # ────────────────── UI Protocol：Skill 支持（ch13） ──────────────────
 
@@ -258,11 +276,13 @@ class CommandMixin:
         """打开历史会话列表（ch09 的扫描与进场逻辑原样复用）。"""
         asyncio.create_task(begin_resume(self))
 
-    def clear_and_new_session(self) -> None:
+    async def clear_and_new_session(self) -> None:
         """/clear：关旧存档 → 开新会话 → 重建 conv 与 runtime → 清零计数与界面（F17/N9）。
 
         旧 JSONL 保留在磁盘上，/resume 列表仍能看到旧会话。
+        ch14：重建前派发 SessionEnd（旧会话），重建后派发 SessionStart（新会话，F9）。
         """
+        await self._dispatch_session_end()
         if self.writer is not None:
             self.writer.close()
         try:
@@ -287,6 +307,7 @@ class CommandMixin:
             self.query_one("#log", RichLog).clear()  # type: ignore[attr-defined]
         except Exception:
             logger.exception("清空对话区失败")
+        await self._dispatch_session_start()
 
     # ────────────────── 斜杠分发 ──────────────────
 

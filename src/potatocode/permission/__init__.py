@@ -8,6 +8,14 @@
 from __future__ import annotations
 
 from .engine import Engine, mode_fallback, new_engine
+from .matcher import (
+    ExactMatcher,
+    GlobMatcher,
+    Matcher,
+    NotMatcher,
+    RegexMatcher,
+    compile_matcher,
+)
 from .persist import ApprovalError, persist_local_allow
 from .types import (
     Category,
@@ -23,8 +31,14 @@ __all__ = [
     "Category",
     "Decision",
     "Engine",
+    "ExactMatcher",
+    "GlobMatcher",
+    "Matcher",
     "Mode",
+    "NotMatcher",
     "Outcome",
+    "RegexMatcher",
+    "compile_matcher",
     "mode_fallback",
     "new_engine",
     "outcome_for_index",

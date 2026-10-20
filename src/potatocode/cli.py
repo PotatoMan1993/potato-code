@@ -11,11 +11,12 @@ import sys
 from datetime import timedelta
 from pathlib import Path
 
-from . import __version__, config, instructions, mcp, memory, permission, session
+from . import __version__, config, hook, instructions, mcp, memory, permission, session
 from .agent import new_runtime
 from .command.skill_register import build_skill_catalog_text
 from .compact import SessionContext, new_session_context, sessions_root
 from .config import ConfigError
+from .hook import Event as HookEvent
 from .logging_setup import close_logging, setup_logging
 from .memory import project_memory_dir, user_memory_dir
 from .skills import SkillExecutor, SkillLoader
@@ -100,6 +101,9 @@ async def _run(root: str, ses_ctx: SessionContext) -> int:
         if err is not None:
             logger.warning("权限引擎降级: %s", err)
             print(f"权限引擎降级: {err}", file=sys.stderr)
+        # ch14 Hook 引擎：扫描两层 hooks.yaml；加载错误一律 stderr、不阻断启动（N1）
+        hook_engine = hook.load(root)
+        logger.info("已加载 %d 条 hook（来源：%s）", len(hook_engine.rules), hook_engine.sources)
         # 会话级运行时：复用启动时建好的会话，使日志文件与运行时指向同一会话（F1/F2）
         runtime = new_runtime(workspace=root, session=ses_ctx)
         app = PotatoCodeApp(
@@ -119,10 +123,21 @@ async def _run(root: str, ses_ctx: SessionContext) -> int:
             skill_executor=skill_executor,
             load_skill_tool=load_skill_tool,
             skill_catalog_text=build_skill_catalog_text(skill_loader),
+            hook_engine=hook_engine,
         )
         # skill 安装完成后重建斜杠命令 + 刷新 Agent 目录（无需重启即可使用，F19）
         install_skill_tool.set_on_installed(app.rebind_skill_commands)
         await app.run_async()
+        # ch14：App 退出后的 SessionEnd 兜底（Ctrl+C 等退出路径也 emit，F9/T20）
+        await hook_engine.dispatch(
+            HookEvent.SESSION_END,
+            {
+                "event": HookEvent.SESSION_END.value,
+                "session_id": runtime.session.session_id,
+                "cwd": root,
+                "mode": app.mode.name.lower(),
+            },
+        )
     except KeyboardInterrupt:
         pass  # 终端层的 Ctrl+C，安静退出
     finally:

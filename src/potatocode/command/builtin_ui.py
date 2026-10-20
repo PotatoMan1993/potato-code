@@ -42,6 +42,7 @@ async def handle_clear(ui: UI) -> None:
 
     inline skill 的 SOP 现在随对话历史进会话存档，开新会话自然全部丢弃，
     不再需要单独清理已激活 skill 的状态。
+    ch14：clear_and_new_session 改为 async，内部串接 SessionEnd/SessionStart 派发。
     """
-    ui.clear_and_new_session()
+    await ui.clear_and_new_session()
     ui.println("已清空当前会话，开启新会话")

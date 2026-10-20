@@ -105,13 +105,28 @@ def test_load_settings_valid(tmp_path):
     assert s.permissions.deny == ["Read(.env)"]
 
 
-def test_to_rule_set_skips_invalid(tmp_path):
+def test_to_rule_set_skips_invalid(tmp_path, capsys):
+    """非法规则跳过、其余正常加载（既有行为保持）。"""
     p = tmp_path / "settings.yaml"
     p.write_text(
         'permissions:\n  allow: ["Bash(git *)", "(bad"]\n  deny: ["Read(.env)"]\n', encoding="utf-8"
     )
     s = load_settings(str(p))
     rs = to_rule_set(s)
-    assert [r.pattern for r in rs.allow] == ["git *"]
+    assert [r.raw for r in rs.allow] == ["git *"]
     assert [r.tool for r in rs.deny] == ["Read"]
     assert rs.deny[0].allow is False
+
+
+def test_to_rule_set_reports_parse_failure_to_stderr(tmp_path, capsys):
+    """解析失败的规则 stderr 打印原文与原因，其余规则不受影响（ch14 F4/T5）。"""
+    p = tmp_path / "settings.yaml"
+    p.write_text(
+        'permissions:\n  allow: ["Bash(~[broken", "Bash(git *)"]\n', encoding="utf-8"
+    )
+    s = load_settings(str(p))
+    rs = to_rule_set(s)
+    captured = capsys.readouterr()
+    assert "parse failed" in captured.err
+    assert "Bash(~[broken" in captured.err
+    assert [r.raw for r in rs.allow] == ["git *"]  # 好规则不受坏规则影响

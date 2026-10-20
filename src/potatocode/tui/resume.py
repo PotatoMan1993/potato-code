@@ -167,7 +167,10 @@ async def begin_resume(app: PotatoCodeApp) -> None:
 
 
 async def do_resume_session(app: PotatoCodeApp, info: SessionInfo) -> None:
-    """恢复指定会话：换上下文 → 必要时压缩 → 时间跨度提醒 → 换存档与历史 → 重绘对话区。"""
+    """恢复指定会话：换上下文 → 必要时压缩 → 时间跨度提醒 → 换存档与历史 → 重绘对话区。
+
+    ch14：确认恢复后先派发 SessionEnd（离开旧会话），完成后派发 SessionResume（F9）。
+    """
     loaded = load_session_full(info.dir)
     msgs: list[Message] = list(loaded.messages)
     if not msgs:
@@ -176,6 +179,7 @@ async def do_resume_session(app: PotatoCodeApp, info: SessionInfo) -> None:
         return
 
     # 确认有内容可恢复才开始：清掉上一会话的 scrollback，后续进度提示与回放按序累积
+    await app._dispatch_session_end()  # ch14：离开旧会话（F9）
     _clear_log(app)
     write_notice(app, f"正在恢复会话 {info.id} ...")
 
@@ -214,6 +218,7 @@ async def do_resume_session(app: PotatoCodeApp, info: SessionInfo) -> None:
     if reminder:
         write_notice(app, reminder)
     write_notice(app, f"已恢复会话 {info.id}，共 {len(msgs)} 条消息")
+    await app._dispatch_session_resume()  # ch14：新会话恢复完成（F9）
 
 
 def _clear_log(app: PotatoCodeApp) -> None:

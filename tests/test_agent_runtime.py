@@ -1,10 +1,11 @@
-"""SessionRuntime 单测：跨轮长生命周期状态与 /clear 的新会话重置（ch12 T0c）。"""
+"""SessionRuntime 单测：跨轮长生命周期状态与 /clear 的新会话重置（ch12 T0c/ch14 T14）。"""
 
 from __future__ import annotations
 
 from potatocode.agent.runtime import new_runtime
 from potatocode.compact import new_session_context
 from potatocode.compact.state import DECISION_REPLACED
+from potatocode.hook import Engine
 
 
 def test_reset_for_new_session_resets_compact_state(tmp_path):
@@ -40,3 +41,36 @@ def test_reset_for_new_session_keeps_old_context_untouched(tmp_path):
     runtime.reset_for_new_session(new_ctx)
     assert runtime.session is new_ctx
     assert old_ctx.session_id != new_ctx.session_id
+
+
+def test_append_and_take_reminders_roundtrip():
+    """pending_reminders：append 累加、take 取出并清空（ch14 F33/T14）。"""
+    runtime = new_runtime(workspace=".")
+    runtime.append_reminders(["用 zh-CN 回复", "注意缩进"])
+    assert runtime.pending_reminders == ["用 zh-CN 回复", "注意缩进"]
+    taken = runtime.take_reminders()
+    assert taken == ["用 zh-CN 回复", "注意缩进"]
+    assert runtime.pending_reminders == []  # 取出即清空
+    assert runtime.take_reminders() == []  # 二次取为空
+
+
+def test_reset_for_new_session_clears_reminders_and_hook_once(tmp_path):
+    """会话重置：pending_reminders 清空、hook 引擎 only_once 集合同步重置（ch14 N5）。"""
+    runtime = new_runtime(workspace=str(tmp_path))
+    runtime.append_reminders(["stale"])
+    hook_engine = Engine([], [])
+    runtime.hook_engine = hook_engine
+    hook_engine._once_fired.add("first-turn")  # 模拟已触发
+
+    runtime.reset_for_new_session(new_session_context(str(tmp_path)))
+
+    assert runtime.pending_reminders == []
+    assert hook_engine._once_fired == set()
+
+
+def test_reset_for_new_session_without_hook_engine(tmp_path):
+    """未注入 hook 引擎时重置不抛（None 兜底）。"""
+    runtime = new_runtime(workspace=str(tmp_path))
+    runtime.append_reminders(["x"])
+    runtime.reset_for_new_session(new_session_context(str(tmp_path)))
+    assert runtime.pending_reminders == []

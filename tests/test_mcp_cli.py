@@ -11,7 +11,7 @@ from potatocode import cli
 from potatocode.agent import new_runtime
 from potatocode.compact import sessions_root
 from potatocode.config import ProviderConfig
-from potatocode.permission import new_engine
+from potatocode.permission import Mode, new_engine
 from potatocode.tool import new_default_registry
 from potatocode.tui import PotatoCodeApp
 
@@ -74,6 +74,7 @@ async def test_amain_registers_mcp_tools_and_closes_manager(monkeypatch):
             skill_executor=None,
             load_skill_tool=None,
             skill_catalog_text="",
+            hook_engine=None,  # ch14：cli 装配注入 hook 引擎
         ):
             observed["providers"] = providers
             observed["definitions"] = registry.definitions()
@@ -85,6 +86,8 @@ async def test_amain_registers_mcp_tools_and_closes_manager(monkeypatch):
 
         def rebind_skill_commands(self):
             observed["rebound"] = True
+
+        mode = Mode.DEFAULT  # 退出兜底 SessionEnd 读当前模式（ch14 T22）
 
         async def run_async(self):
             observed["ran"] = True

@@ -1,8 +1,9 @@
-"""配置加载、友好名/类别映射与目标提取（F4/F5/N7）。"""
+"""配置加载、友好名/类别映射与目标提取（F4/F5/N7；ch14 T4 失败规则 stderr 报告）。"""
 
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -156,16 +157,24 @@ def load_settings(path: str) -> Settings:
 
 
 def to_rule_set(s: Settings) -> RuleSet:
-    """把 Settings 转成 RuleSet：allow/deny 各条 parse_rule，非法条目跳过（N5）。"""
+    """把 Settings 转成 RuleSet：allow/deny 各条 parse_rule。
+
+    ch14 F4：解析失败的规则改为 stderr 打印规则原文与原因后跳过（不再静默），
+    其余规则正常加载、互不影响。
+    """
     rs = RuleSet()
     for text in s.permissions.allow:
-        rule, ok = parse_rule(text)
-        if ok:
-            rs.allow.append(rule)
+        rule, err = parse_rule(text)
+        if rule is None:
+            print(f'rule {text!r} parse failed: {err}', file=sys.stderr)
+            continue
+        rs.allow.append(rule)
     for text in s.permissions.deny:
-        rule, ok = parse_rule(text)
-        if ok:
-            rs.deny.append(replace(rule, allow=False))
+        rule, err = parse_rule(text)
+        if rule is None:
+            print(f'rule {text!r} parse failed: {err}', file=sys.stderr)
+            continue
+        rs.deny.append(replace(rule, allow=False))
     return rs
 
 

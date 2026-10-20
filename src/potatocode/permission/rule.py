@@ -1,20 +1,30 @@
-"""规则与匹配（F3）：以「工具名(模式)」声明 allow/deny，支持精确与 glob 匹配。"""
+"""规则与匹配（F3/ch14 F1-F5）：以「工具名(模式)」声明 allow/deny。
+
+模式段在 ch14 升级为结构化 Matcher（见 matcher.py）：``=精确`` / ``~正则`` /
+``!反向`` 前缀 + 缺省 glob，四种语义共用一套实现；pattern 为空表示匹配该工具
+全部调用。Allow/Deny 判定语义与 ch08 一致，仅匹配表达力扩展。
+"""
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from .types import Decision
+
+if TYPE_CHECKING:
+    from .matcher import Matcher
 
 
 @dataclass
 class Rule:
-    """单条规则：友好工具名 + 模式段；pattern 为空表示匹配该工具全部调用。"""
+    """单条规则：友好工具名 + 匹配器；matcher 为 None 表示匹配该工具全部调用。"""
 
     tool: str  # 友好名：Bash/Read/Write/Edit/Glob/Grep
-    pattern: str  # 模式段；"" 表示全匹配
+    matcher: Matcher | None  # None 表示全匹配（原空 pattern 语义）
     allow: bool  # True=allow, False=deny
+    raw: str  # 原始模式描述串，仅供错误日志与调试展示
 
 
 @dataclass
@@ -27,10 +37,10 @@ class RuleSet:
     def find(self, friendly: str, target: str) -> Rule | None:
         """返回命中规则：先 deny 再 allow；未命中返回 None。"""
         for r in self.deny:
-            if r.tool == friendly and match_pattern(r.pattern, target):
+            if r.tool == friendly and match_rule(r, target):
                 return r
         for r in self.allow:
-            if r.tool == friendly and match_pattern(r.pattern, target):
+            if r.tool == friendly and match_rule(r, target):
                 return r
         return None
 
@@ -42,30 +52,52 @@ class RuleSet:
         return (Decision.DENY if not r.allow else Decision.ALLOW), True
 
 
-def parse_rule(s: str) -> tuple[Rule, bool]:
-    """解析 `Tool(pattern)` 或 `Tool` 为 Rule。
+def match_rule(r: Rule, target: str) -> bool:
+    """单条规则匹配：全匹配规则恒 True，其余交给 matcher（ch14 T3）。"""
+    if r.matcher is None:
+        return True
+    return r.matcher.match(target)
 
-    非法（空、括号不配对、工具名为空）返回 (Rule("","",False), False)。
+
+def parse_rule(s: str) -> tuple[Rule | None, str | None]:
+    """解析 `Tool(pattern)` 或 `Tool` 为 Rule（ch14 T3）。
+
+    pattern 支持四种类型前缀（=精确 / ~正则 / !反向 / 缺省 glob），由
+    `compile_matcher` 统一编译；空 pattern 仍表示全匹配（matcher=None）。
+
+    成功返回 (Rule, None)；失败返回 (None, 错误描述)——调用方负责 stderr 报告
+    并跳过该条（ch14 F4），不再静默。
     """
     s = (s or "").strip()
     if not s:
-        return Rule("", "", False), False
+        return None, "规则串为空"
+    pattern = ""
     if s.endswith(")"):
         idx = s.find("(")
         if idx <= 0:
-            return Rule("", "", False), False
+            return None, f"括号不配对: {s!r}"
         tool = s[:idx].strip()
         pattern = s[idx + 1 : -1].strip()
         if not tool:
-            return Rule("", "", False), False
-        return Rule(tool, pattern, True), True
-    if "(" in s or ")" in s:
+            return None, f"工具名为空: {s!r}"
+    elif "(" in s or ")" in s:
         # 括号不配对
-        return Rule("", "", False), False
-    tool = s.strip()
-    if not tool:
-        return Rule("", "", False), False
-    return Rule(tool, "", True), True
+        return None, f"括号不配对: {s!r}"
+    else:
+        tool = s.strip()
+        if not tool:
+            return None, "规则串为空"
+
+    if not pattern:
+        return Rule(tool=tool, matcher=None, allow=True, raw=""), None
+    try:
+        from .matcher import compile_matcher
+
+        # 命令类工具（Bash）走整串通配，其余按路径分段（与 ch08 语义一致）
+        matcher = compile_matcher(pattern, is_command=(tool == "Bash"))
+    except ValueError as e:
+        return None, str(e)
+    return Rule(tool=tool, matcher=matcher, allow=True, raw=pattern), None
 
 
 def _glob_regex(pattern: str) -> str:
@@ -126,4 +158,4 @@ def match_pattern(pattern: str, target: str, *, path: bool | None = None) -> boo
     return re.fullmatch(_glob_regex(pattern), target) is not None
 
 
-__all__ = ["Rule", "RuleSet", "match_pattern", "parse_rule"]
+__all__ = ["Rule", "RuleSet", "match_pattern", "match_rule", "parse_rule"]

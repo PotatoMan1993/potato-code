@@ -33,7 +33,8 @@ def test_rule_for_file_relpath(tmp_path):
     rule, text, ok = rule_for(eng, _call("write_file", {"path": "src/a.py", "content": "x"}))
     assert ok
     assert rule.tool == "Write"
-    assert rule.pattern == "src/a.py"
+    assert rule.raw == "src/a.py"
+    assert rule.matcher is not None and rule.matcher.match("src/a.py")
     assert text == "Write(src/a.py)"
 
 

@@ -18,13 +18,14 @@ from potatocode.command.ui import UI
 from potatocode.permission import Mode
 from potatocode.prompt import EXECUTE_DIRECTIVE
 
-# 12 条内置命令的固定名单（G1），按字典序
+# 13 条内置命令的固定名单（G1/ch14 /hooks），按字典序
 BUILTIN_NAMES = [
     "clear",
     "compact",
     "do",
     "exit",
     "help",
+    "hooks",
     "memory",
     "permission",
     "plan",
@@ -41,6 +42,7 @@ EXPECTED_KINDS: dict[str, Kind] = {
     "do": Kind.PROMPT,
     "exit": Kind.UI,
     "help": Kind.LOCAL,
+    "hooks": Kind.LOCAL,
     "memory": Kind.LOCAL,
     "permission": Kind.LOCAL,
     "plan": Kind.UI,
@@ -105,10 +107,10 @@ def _registry() -> Registry:
 
 
 def test_register_builtins_all_registered():
-    """注册后恰好 12 条可见命令，名字完整、全小写、互不重复、Kind 正确。"""
+    """注册后恰好 13 条可见命令，名字完整、全小写、互不重复、Kind 正确。"""
     reg = _registry()
     visible = reg.visible()
-    assert [c.name for c in visible] == BUILTIN_NAMES  # 字典序排列且恰好 12 条
+    assert [c.name for c in visible] == BUILTIN_NAMES  # 字典序排列且恰好 13 条
     for cmd in visible:
         assert cmd.name == cmd.name.lower()
         assert cmd.description
@@ -244,8 +246,13 @@ async def test_handle_review_injects_directive():
 
 
 async def test_handle_clear_calls_ui_and_prints():
-    """/clear 调用 clear_and_new_session 并输出提示（F17）。"""
+    """/clear 调用 clear_and_new_session（async，ch14）并输出提示（F17）。"""
     ui = RecordingUI()
+
+    async def _async_clear() -> None:
+        ui.clear_calls += 1
+
+    ui.clear_and_new_session = _async_clear  # type: ignore[method-assign]
     await builtin_ui.handle_clear(ui)
     assert ui.clear_calls == 1
     assert ui.prints == ["已清空当前会话，开启新会话"]

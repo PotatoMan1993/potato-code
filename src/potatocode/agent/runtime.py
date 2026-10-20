@@ -6,7 +6,8 @@ TUI 历史上每轮都重新构造一次 Agent，若把压缩相关状态放在 
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from ..compact import (
     CompactCircuitBreaker,
@@ -15,6 +16,9 @@ from ..compact import (
     SessionContext,
     new_session_context,
 )
+
+if TYPE_CHECKING:
+    from ..hook import Engine
 
 
 @dataclass
@@ -29,6 +33,11 @@ class SessionRuntime:
     usage_anchor: int = 0  # 上一次主对话 stream 的真实用量之和；摘要请求不更新
     anchor_msg_len: int = 0  # 记录锚点时的会话条数，供增量估算划界
     turn_count: int = 0  # 已自然完成的对话轮数（ch11：每 5 轮触发一次记忆更新）
+    workspace: str = ""  # 项目工作目录（ch14：hook payload 的 cwd 通用字段）
+    # ch14 Hook 系统：待注入的 reminder 队列（下一轮 stream_once 取出后清空）
+    pending_reminders: list[str] = field(default_factory=list)
+    # ch14 Hook 引擎：由 cli/tui 装配注入；only_once 集合挂在引擎上、随会话重置
+    hook_engine: Engine | None = None
     # 字段读写都在 asyncio 单线程事件循环内完成，无需额外加锁
 
     def reset_for_new_session(self, ses_ctx: SessionContext) -> None:
@@ -36,7 +45,8 @@ class SessionRuntime:
 
         compact 三个子状态全部换新实例，用量锚点与轮数清零，会话指向新的
         `ses_ctx`；`context_window` 跟随 provider 保留，writer 与 conv 的重建由
-        调用方负责，不进本接口。
+        调用方负责，不进本接口。ch14：pending_reminders 清空、hook 引擎的
+        only_once 集合同步重置（N5——与 ActiveSkills 同生命周期）。
         """
         self.replacement = ContentReplacementState()
         self.recovery = RecoveryState()
@@ -45,6 +55,19 @@ class SessionRuntime:
         self.usage_anchor = 0
         self.anchor_msg_len = 0
         self.turn_count = 0
+        self.pending_reminders.clear()
+        if self.hook_engine is not None:
+            self.hook_engine.reset_for_new_session()
+
+    def append_reminders(self, prompts: list[str]) -> None:
+        """把 hook 注入的 prompt 追加到待注入队列（ch14 F31/F33）。"""
+        self.pending_reminders.extend(prompts)
+
+    def take_reminders(self) -> list[str]:
+        """取出并清空待注入队列：仅在下一轮 stream_once 装配 reminder 时调用（ch14 F33）。"""
+        taken = self.pending_reminders
+        self.pending_reminders = []
+        return taken
 
 
 def new_runtime(
@@ -63,4 +86,5 @@ def new_runtime(
         auto_tracking=CompactCircuitBreaker(),
         session=session if session is not None else new_session_context(workspace),
         context_window=context_window,
+        workspace=workspace,
     )
