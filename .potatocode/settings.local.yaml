@@ -1,0 +1,5 @@
+permissions:
+  allow:
+  - Bash(cd /d D:\\AiLearning\\code\\potato-code && git status --porcelain src/potatocode/llm/
+    && echo --- && git diff --stat src/potatocode/llm/__init__.py)
+  deny: []

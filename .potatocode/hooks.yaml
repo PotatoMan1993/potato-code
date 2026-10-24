@@ -1,0 +1,16 @@
+hooks:
+  - name: block-json-write
+    event: PreToolUse
+    if: 
+      all_of:
+        - field: tool_name
+          match: 
+            type: exact
+            value: write_file
+        - field: tool_input.path
+          match:
+            type: regex
+            value: \.json$
+    action: 
+      type: shell
+      command: 'echo "禁止直接写入 JSON 文件，请使用专用工具" >&2; exit 2'

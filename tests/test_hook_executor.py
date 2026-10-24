@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 
 import httpx
+import pytest
 
+import potatocode.hook.executor as executor_module
 from potatocode.hook.event import Event
 from potatocode.hook.executor import ExecutionResult, Executor
 from potatocode.hook.rule import (
@@ -20,6 +23,14 @@ from potatocode.hook.rule import (
 )
 
 PAYLOAD = {"event": "PreToolUse", "session_id": "s1", "cwd": "/w", "mode": "default"}
+
+
+@pytest.fixture(autouse=True)
+def _clear_posix_shell_cache():
+    """`_posix_shell_path` 带 lru_cache：每条用例前后清空，保证 monkeypatch 生效。"""
+    executor_module._posix_shell_path.cache_clear()
+    yield
+    executor_module._posix_shell_path.cache_clear()
 
 
 def _shell_rule(command: str, timeout_s: float = 10.0) -> Rule:
@@ -95,11 +106,16 @@ async def test_shell_stdin_receives_sorted_payload_json():
 
 async def test_shell_stdin_json_key_order():
     """直接验证 stdin JSON 的 key 字典序（N6）。"""
-    proc = await asyncio.create_subprocess_shell(
-        "cat", stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE
-    )
     from potatocode.hook.executor import _marshal_sorted
 
+    # 用当前解释器回显 stdin，不依赖 POSIX shell（Windows 上可能没有 sh/cat）
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import sys; sys.stdout.write(sys.stdin.read())",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+    )
     out, _ = await proc.communicate(_marshal_sorted({"b": 2, "a": 1}))
     assert out.decode() == '{"a": 1, "b": 2}'
 
@@ -245,3 +261,53 @@ def test_execution_result_defaults():
     assert result.reason == ""
     assert result.prompt == ""
     assert result.err is None
+
+
+# ---- shell 查找：PATH 上的 sh 优先、Windows 无 sh 时探测 Git Bash（ch14 F17） ----
+
+
+def test_shell_argv_prefers_posix_shell_from_path(monkeypatch):
+    """PATH 上有 sh：_shell_argv 走 `[sh, -c, command]` exec 路径。"""
+    monkeypatch.setattr(
+        executor_module.shutil,
+        "which",
+        lambda name: "/usr/bin/sh" if name == "sh" else None,
+    )
+    assert executor_module._shell_argv("echo hi") == ["/usr/bin/sh", "-c", "echo hi"]
+
+
+def test_find_git_bash_sh_derives_from_git_executable(tmp_path, monkeypatch):
+    """PATH 上有 git.exe：由 `<GitRoot>\\cmd\\git.exe` 反推出 `<GitRoot>\\bin\\sh.exe`。"""
+    git_root = tmp_path / "Git"
+    shell_path = git_root / "bin" / "sh.exe"
+    shell_path.parent.mkdir(parents=True)
+    shell_path.write_text("")
+    git_executable = git_root / "cmd" / "git.exe"
+
+    monkeypatch.setattr(
+        executor_module.shutil,
+        "which",
+        lambda name: str(git_executable) if name == "git" else None,
+    )
+    assert executor_module._find_git_bash_sh() == str(shell_path)
+
+
+def test_find_git_bash_sh_uses_env_dirs_when_git_not_on_path(tmp_path, monkeypatch):
+    """PATH 上没有 git：退化为按 PROGRAMFILES 等环境变量探测常见安装目录。"""
+    shell_path = tmp_path / "Git" / "bin" / "sh.exe"
+    shell_path.parent.mkdir(parents=True)
+    shell_path.write_text("")
+
+    monkeypatch.setattr(executor_module.shutil, "which", lambda name: None)
+    monkeypatch.setenv("PROGRAMFILES", str(tmp_path))
+    monkeypatch.setenv("PROGRAMFILES(X86)", "")
+    monkeypatch.setenv("LOCALAPPDATA", "")
+    assert executor_module._find_git_bash_sh() == str(shell_path)
+
+
+def test_posix_shell_path_none_when_no_shell_available(monkeypatch):
+    """非 Windows 且 PATH 无 sh：返回 None，交由平台默认 shell 兜底（保持旧行为）。"""
+    monkeypatch.setattr(executor_module.shutil, "which", lambda name: None)
+    monkeypatch.setattr(executor_module.sys, "platform", "linux")
+    assert executor_module._posix_shell_path() is None
+    assert executor_module._shell_argv("echo hi") is None

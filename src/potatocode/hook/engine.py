@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import logging
 from dataclasses import dataclass, field
 
 from .event import Event, is_blocking
 from .executor import Executor
 from .matcher import eval_condition
 from .rule import Payload, Rule
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -62,6 +65,7 @@ class Engine:
             if not eval_condition(rule.condition, payload):
                 continue
 
+            logger.debug(f'hit rule "{rule.name}"')
             if rule.asyncio_mode:
                 # async hook：起 task 后立即继续，不参与 blocked / injected_prompts（ch14 G8）
                 asyncio.create_task(self._executor.run(rule, payload, blocking=False))

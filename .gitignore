@@ -11,7 +11,7 @@ __pycache__/
 .ruff_cache/
 
 # PotatoCode 运行配置（含真实密钥，N5）
-.potatocode/*.yaml
+.potatocode/config.yaml
 
 # 会话落盘目录（工具结果预览体原文，调试副产物）
 .potatocode/sessions/
@@ -20,4 +20,4 @@ __pycache__/
 api_keys.txt
 
 # 本地 skill 目录（ch13 测试副产物；项目要分发的 skill 可自行调整此规则）
-.potatocode/skills/
+# .potatocode/skills/

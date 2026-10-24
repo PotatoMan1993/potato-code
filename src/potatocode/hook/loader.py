@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import sys
+import logging
 from pathlib import Path
 
 import yaml
@@ -28,6 +29,8 @@ from .rule import (
     ShellAction,
     SubagentAction,
 )
+
+logger = logging.getLogger(__name__)
 
 # 有效的 match.type 字面量（ch14 F14）
 _MATCH_TYPES = {"exact", "glob", "regex", "not"}
@@ -64,14 +67,13 @@ def load(project_root: str | Path) -> Engine:
                 hook_name = (
                     raw_rule.get("name") if isinstance(raw_rule, dict) else None
                 ) or f"#{idx}"
-                print(f'hook "{hook_name}": {err}, skipped', file=sys.stderr)
+                logger.error(f'hook "{hook_name}": {err}, skipped')
                 continue
             if compiled.name in seen_names:
                 # 同名 hook 冲突：保留先到者、跳过后到者（ch14 F7）
-                print(
+                logger.error(
                     f'hook "{compiled.name}": duplicate name across files, '
-                    f"skipped later rule from {compiled.source}",
-                    file=sys.stderr,
+                    f"skipped later rule from {compiled.source}"
                 )
                 continue
             seen_names.add(compiled.name)
@@ -84,15 +86,12 @@ def _read_hook_file(hook_file: Path) -> list | None:
     try:
         raw = yaml.safe_load(hook_file.read_text(encoding="utf-8"))
     except (yaml.YAMLError, OSError) as e:
-        print(f"hooks.yaml parse failed: {hook_file}: {e}", file=sys.stderr)
+        logger.error(f"hooks.yaml parse failed: {hook_file}: {e}")
         return None
     if raw is None:
         return []
     if not isinstance(raw, dict) or not isinstance(raw.get("hooks"), list):
-        print(
-            f"hooks.yaml structure invalid (expected top-level `hooks:` list): {hook_file}",
-            file=sys.stderr,
-        )
+        logger.error(f"hooks.yaml structure invalid (expected top-level `hooks:` list): {hook_file}")
         return None
     return raw["hooks"]
 

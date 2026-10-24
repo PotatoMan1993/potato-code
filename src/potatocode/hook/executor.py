@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import sys
 from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
 
 import httpx
 
@@ -35,15 +38,70 @@ def _marshal_sorted(payload: Payload) -> bytes:
     return json.dumps(payload, sort_keys=True).encode()
 
 
+# Windows 上兜底查找 Git Bash 的 `sh.exe`：环境变量名 -> 其下的相对路径分段。
+# hook 命令约定用 sh 语法（`>&2`、`;`、`exit 2`），cmd.exe 无法解释，故优先走 Git Bash。
+_WINDOWS_GIT_BASH_ENV_CANDIDATES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("PROGRAMFILES", ("Git", "bin", "sh.exe")),
+    ("PROGRAMFILES(X86)", ("Git", "bin", "sh.exe")),
+    ("LOCALAPPDATA", ("Programs", "Git", "bin", "sh.exe")),
+)
+
+
+def _git_installation_sh(candidate_path: Path) -> str | None:
+    """把候选路径规整为可直接执行的 sh 路径；文件不存在返回 None。"""
+    if candidate_path.is_file():
+        return str(candidate_path)
+    return None
+
+
+def _find_git_bash_sh() -> str | None:
+    """在 Windows 上探测 Git Bash 的 `sh.exe`：先由 git.exe 反推安装根目录，再查环境变量。
+
+    git 一般装在 `<GitRoot>\\cmd\\git.exe`，对应 shell 在 `<GitRoot>\\bin\\sh.exe`；
+    PATH 里没有 git 时退化为按常见安装目录（Program Files / LOCALAPPDATA）逐个探测。
+    """
+    git_executable = shutil.which("git")
+    if git_executable:
+        sh_from_git = _git_installation_sh(
+            Path(git_executable).parent.parent / "bin" / "sh.exe"
+        )
+        if sh_from_git is not None:
+            return sh_from_git
+    for env_name, relative_parts in _WINDOWS_GIT_BASH_ENV_CANDIDATES:
+        base_directory = os.environ.get(env_name)
+        if not base_directory:
+            continue
+        sh_path = _git_installation_sh(Path(base_directory).joinpath(*relative_parts))
+        if sh_path is not None:
+            return sh_path
+    return None
+
+
+@lru_cache(maxsize=1)
+def _posix_shell_path() -> str | None:
+    """查找可解释 sh 语法命令的 POSIX shell 路径；找不到返回 None（回落平台默认 shell）。
+
+    查找顺序：PATH 上的 `sh` -> Windows 上的 Git Bash `sh.exe`。结果缓存，避免每次
+    hook 触发都做文件系统探测（探测只影响进程生命周期，安装 Git 后需重启 potatocode）。
+    """
+    sh_from_path = shutil.which("sh")
+    if sh_from_path:
+        return sh_from_path
+    if sys.platform == "win32":
+        return _find_git_bash_sh()
+    return None
+
+
 def _shell_argv(command: str) -> list[str] | None:
     """解析 shell 启动参数（ch14 F17：命令由 sh -c 解释执行）。
 
     PATH 上有 sh（类 Unix 或 Git Bash）时返回 `["sh", "-c", command]` 走 exec；
-    否则返回 None，由 `asyncio.create_subprocess_shell` 用平台默认 shell 兜底。
+    Windows 上 PATH 没有 sh 时继续探测 Git Bash 安装目录（见 `_posix_shell_path`）；
+    仍找不到则返回 None，由 `asyncio.create_subprocess_shell` 用平台默认 shell 兜底。
     """
-    sh_path = shutil.which("sh")
-    if sh_path:
-        return [sh_path, "-c", command]
+    shell_path = _posix_shell_path()
+    if shell_path:
+        return [shell_path, "-c", command]
     return None
 
 

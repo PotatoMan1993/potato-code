@@ -691,7 +691,7 @@ class Agent:
         )
         logger.debug(f"Request system.stabel: {req.system.stable}")
         logger.debug(f"Request system.environment: {req.system.environment}")
-        logger.debug(f"Request messages: {req.messages}")
+        logger.debug(f"Request messages: {'\n'.join([str(e) for e in req.messages])}")
         async for ev in self._provider.stream(req):
             if cancel.is_set():
                 yield _StreamOutcome(ok=False)
