@@ -4,7 +4,9 @@ inline skill 不经执行器：斜杠命令把 SOP 作为 user 消息注入，Lo
 SOP 作为 toolResult 返回。执行器只负责 fork 路径（execute_fork 同步取结果 /
 spawn_fork 后台启动回流）。fork 对宿主（TUI App）的依赖经 `SkillHost` 窄协议
 在执行期注入，skills 包不反向依赖 TUI；对 Agent 类的引用用局部 import，避免
-agent ↔ skills 循环依赖（spec 5）。
+agent ↔ skills 循环依赖（spec 5）。ch15 起子 Agent 的构造与跑动统一复用
+`agent.launch_fork`（G10/F33）：受限注册中心、全新运行时、run_to_completion、
+审批自动拒绝与嵌套阻断全部走 SubAgent 底座。
 """
 
 from __future__ import annotations
@@ -23,7 +25,6 @@ from ..compact import (
 from ..compact.layer2 import summarize_once
 from ..conversation import Conversation
 from ..llm import ROLE_ASSISTANT, ROLE_USER, Message
-from ..permission import Mode, Outcome
 from .loader import SkillLoader
 from .parser import DEFAULT_SKILL_CONTEXT, VALID_SKILL_CONTEXTS, SkillDef, substitute_arguments
 
@@ -125,10 +126,13 @@ class SkillExecutor:
         host.skill_deliver_result(final_text)
 
     async def execute_fork(self, skill: SkillDef, args: str, host: SkillHost) -> str:
-        """fork 执行（F7/T5）：独立 Conversation + 临时 Agent，跑完后回流最终文本。
+        """fork 执行（F7/T5）：独立 Conversation + 复用 SubAgent 底座，跑完回流最终文本。
 
-        主对话状态不被子 Agent 修改（N3）；任何一步失败都返回带错误标记的文本，
-        调用方仍把它作为 assistant 消息写回主对话，无需再处理异常。
+        ch15 G10/F33：子 Agent 的构造、运行时隔离与跑动统一交给
+        `agent.launch_fork`（run_to_completion 内含审批自动拒绝与 hook 分派）；
+        本方法只负责 skill 专属的两件事——按 context 档装填子对话、剔除系统级
+        工具的子注册中心。任何一步失败都返回带错误标记的文本，调用方仍把它作为
+        assistant 消息写回主对话，无需再处理异常。
         """
         rendered_body = substitute_arguments(skill.prompt_body, args)
         provider = host.skill_provider()
@@ -138,61 +142,23 @@ class SkillExecutor:
             fork_conversation = await self._build_fork_conversation(skill, rendered_body, host)
             fork_registry = self._build_fork_registry(host.skill_tool_registry())
             # 局部 import 避免循环依赖（spec 5 下行依赖约定）
-            from ..agent import Agent as AgentClass
+            from ..agent.launch import ForkLaunchOpts, launch_fork
 
-            main_runtime = host.skill_runtime()
-            fork_runtime = self._new_fork_runtime(main_runtime)
-            fork_agent = AgentClass(
-                provider,
-                fork_registry,
-                host.skill_engine(),
-                host.skill_version(),
-                runtime=fork_runtime,
+            return await launch_fork(
+                ForkLaunchOpts(
+                    provider=provider,
+                    registry=fork_registry,
+                    engine=host.skill_engine(),
+                    version=host.skill_version(),
+                    conv=fork_conversation,
+                    parent_runtime=host.skill_runtime(),
+                )
             )
-            return await self._run_fork_agent(fork_agent, fork_conversation)
         except asyncio.CancelledError:
             raise  # 宿主退出等取消：按 asyncio 约定向上传播
         except Exception as fork_error:
             logger.exception("fork skill '%s' 执行失败", skill.name)
             return f"[skill '{skill.name}' fork 失败: {type(fork_error).__name__}: {fork_error}]"
-
-    async def _run_fork_agent(self, fork_agent: Agent, fork_conversation: Conversation) -> str:
-        """跑 fork 子 Agent 直到 Loop 结束：累计 StreamText（Event.text）到 done（T5）。
-
-        fork 无人值守：权限询问一律自动拒绝（安全默认，N3），子 Agent 收到被拒结果
-        后自行调整路径；fork 用量不写回主对话锚点（锚点语义是主对话 stream 的真实用量）。
-        """
-        cancel_event = asyncio.Event()
-        text_parts: list[str] = []
-        async for event in fork_agent.run(fork_conversation, Mode.DEFAULT, cancel_event):
-            if event.approval is not None:
-                if not event.approval.respond.done():
-                    event.approval.respond.set_result(Outcome.DENY_ONCE)
-                continue
-            if event.err is not None:
-                text_parts.append(f"\n\n[fork 执行出错: {event.err}]")
-                break
-            if event.text:
-                text_parts.append(event.text)
-            if event.done:
-                break
-        return "".join(text_parts).strip()
-
-    def _new_fork_runtime(self, main_runtime: SessionRuntime) -> SessionRuntime:
-        """构造 fork 专用的全新运行时：compact 状态全新，session 标识沿用主会话（N3）。
-
-        沿用 session 标识是为了不往会话目录里塞一堆空的 fork 会话（/resume 列表
-        会被污染）；fork 会话本身不挂 writer，不产生任何落盘。
-        """
-        from ..agent.runtime import SessionRuntime as SessionRuntimeClass
-
-        return SessionRuntimeClass(
-            replacement=ContentReplacementState(),
-            recovery=RecoveryState(),
-            auto_tracking=CompactCircuitBreaker(),
-            session=main_runtime.session,
-            context_window=main_runtime.context_window,
-        )
 
     def _build_fork_registry(self, main_registry: Registry) -> Registry:
         """构造 fork 工具注册中心：剔除系统级工具，其余照搬（N3）。"""

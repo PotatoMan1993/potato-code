@@ -202,3 +202,35 @@ def test_example_config_is_parseable():
     first = cfg.providers[0]
     assert first.context_window == 200000
     assert effective_context_window(first) == 200000
+
+
+def test_enable_subagent_background_default(tmp_path):
+    """未配置 enable_subagent_background：字段为 None，effective 视为 True（ch15 N6）。"""
+    cfg = load(write_config(tmp_path, VALID_YAML))
+    assert cfg.enable_subagent_background is None
+    assert cfg.effective_enable_subagent_background() is True
+
+
+def test_enable_subagent_background_false(tmp_path):
+    """显式 false：effective 返回 False，后台/Fork 全部强制前台（ch15 N6/AC18）。"""
+    cfg = load(
+        write_config(
+            tmp_path,
+            VALID_YAML + "\nenable_subagent_background: false\n",
+        )
+    )
+    assert cfg.enable_subagent_background is False
+    assert cfg.effective_enable_subagent_background() is False
+
+
+def test_enable_subagent_background_true(tmp_path):
+    cfg = load(
+        write_config(tmp_path, VALID_YAML + "\nenable_subagent_background: true\n")
+    )
+    assert cfg.effective_enable_subagent_background() is True
+
+
+def test_enable_subagent_background_invalid_type(tmp_path):
+    """非布尔值应报 ConfigError。"""
+    with pytest.raises(ConfigError, match="enable_subagent_background"):
+        load(write_config(tmp_path, VALID_YAML + "\nenable_subagent_background: yes-or-no\n"))

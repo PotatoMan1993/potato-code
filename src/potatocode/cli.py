@@ -11,8 +11,20 @@ import sys
 from datetime import timedelta
 from pathlib import Path
 
-from . import __version__, config, hook, instructions, mcp, memory, permission, session
+from . import (
+    __version__,
+    config,
+    hook,
+    instructions,
+    mcp,
+    memory,
+    permission,
+    session,
+    subagent,
+    task,
+)
 from .agent import new_runtime
+from .agent.agent_tool import AgentTool
 from .command.skill_register import build_skill_catalog_text
 from .compact import SessionContext, new_session_context, sessions_root
 from .config import ConfigError
@@ -92,6 +104,22 @@ async def _run(root: str, ses_ctx: SessionContext) -> int:
     registry.register(install_skill_tool)
     loaded_skill_names = ", ".join(skill_loader.names())
     logger.info("已加载 %d 个 skill: %s", len(skill_loader.names()), loaded_skill_names)
+    # ch15 SubAgent 机制：三层目录加载 + 后台任务管理器 + 5 个新工具
+    # （TaskList / TaskGet / TaskStop / SendMessage / Agent），注册进同一 Registry
+    subagent_catalog = subagent.load_catalog(root)
+    task_mgr = task.Manager()
+    registry.register(task.TaskListTool(task_mgr))
+    registry.register(task.TaskGetTool(task_mgr))
+    registry.register(task.TaskStopTool(task_mgr))
+    registry.register(task.SendMessageTool(task_mgr))
+    agent_tool = AgentTool(
+        subagent_catalog, task_mgr, bg_enabled=cfg.effective_enable_subagent_background()
+    )
+    registry.register(agent_tool)
+    logger.info(
+        "已加载 %d 个 Agent 角色（内置/用户/项目）",
+        len(subagent_catalog.list()),
+    )
     manager = await mcp.new_manager(mcp.load_config(root), version=__version__)
     try:
         for remote_tool in manager.tools():
@@ -124,7 +152,13 @@ async def _run(root: str, ses_ctx: SessionContext) -> int:
             load_skill_tool=load_skill_tool,
             skill_catalog_text=build_skill_catalog_text(skill_loader),
             hook_engine=hook_engine,
+            task_mgr=task_mgr,
+            subagent_catalog=subagent_catalog,
         )
+        # ch15：Agent 工具的 parent 经 getter 回填——主 Agent 在 provider 选定后才构造
+        # （getter 保证换 provider 重建后引用依然有效）；Fork 路径经 conv getter 克隆主对话
+        agent_tool.set_parent_getter(app.ensure_agent)
+        agent_tool.set_parent_conv_getter(lambda: app.conv)
         # skill 安装完成后重建斜杠命令 + 刷新 Agent 目录（无需重启即可使用，F19）
         install_skill_tool.set_on_installed(app.rebind_skill_commands)
         await app.run_async()

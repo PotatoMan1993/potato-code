@@ -30,9 +30,15 @@ class ProviderConfig:
 
 @dataclass
 class Config:
-    """应用配置：providers 列表。"""
+    """应用配置：providers 列表 + 子 Agent 后台开关（ch15 N6）。"""
 
     providers: list[ProviderConfig] = field(default_factory=list)
+    # ch15 N6：False 时所有 SubAgent 强制前台同步（超时切后台 / Fork 均失效）；None 视为 True
+    enable_subagent_background: bool | None = None
+
+    def effective_enable_subagent_background(self) -> bool:
+        """后台能力是否可用：未配置默认开启（ch15 N6）。"""
+        return True if self.enable_subagent_background is None else self.enable_subagent_background
 
 
 # protocol 合法取值
@@ -77,7 +83,13 @@ def _from_dict(raw: object, path: str) -> Config:
     providers: list[ProviderConfig] = []
     for i, item in enumerate(providers_raw):
         providers.append(_parse_provider(item, i))
-    return Config(providers=providers)
+
+    # 可选布尔开关（ch15 N6）：缺省 None（视为 True）
+    enable_bg = raw.get("enable_subagent_background")
+    if enable_bg is not None and not isinstance(enable_bg, bool):
+        raise ConfigError("enable_subagent_background 应为布尔值")
+
+    return Config(providers=providers, enable_subagent_background=enable_bg)
 
 
 def _parse_provider(item: object, index: int) -> ProviderConfig:

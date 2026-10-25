@@ -88,3 +88,20 @@ def new_runtime(
         context_window=context_window,
         workspace=workspace,
     )
+
+
+def new_sub_runtime(parent: SessionRuntime) -> SessionRuntime:
+    """构造子 Agent 专用的全新运行时（ch15 F11/N3）。
+
+    compact 三个子状态全新（决策账本 / 文件追踪 / 熔断器与父互不影响）；会话
+    标识沿用父会话（不往会话目录里塞一堆空子会话）、上下文窗口与工作目录随父，
+    子会话本身不挂 writer、不产生任何落盘。
+    """
+    return SessionRuntime(
+        replacement=ContentReplacementState(),
+        recovery=RecoveryState(),
+        auto_tracking=CompactCircuitBreaker(),
+        session=parent.session,
+        context_window=parent.context_window,
+        workspace=parent.workspace,
+    )

@@ -107,6 +107,7 @@ async def test_approval_menu_navigation_and_enter(tmp_path):
         respond = loop.create_future()
         app.pending = _pending(respond)
         app.state = SessionState.APPROVING
+        app._approval_prev_state = SessionState.STREAMING  # ch15：模拟主循环轮次中弹出的审批
         app.approve_cursor = 0
 
         app.update_approving("down")
@@ -146,6 +147,7 @@ async def test_approval_escape_cancels(tmp_path):
         respond = loop.create_future()
         app.pending = _pending(respond)
         app.state = SessionState.APPROVING
+        app._approval_prev_state = SessionState.STREAMING  # ch15：模拟主循环轮次中弹出的审批
 
         app.action_cancel_turn()  # Esc 分派
         assert respond.result() is Outcome.DENY_ONCE

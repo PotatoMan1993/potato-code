@@ -89,17 +89,21 @@ class StreamMixin:
                     )
                     continue
                 if ev.approval is not None:
-                    # 人在回路（F8）：切 APPROVING、暂停读事件，等用户决策
-                    self.pending = ev.approval
-                    self.approve_cursor = 0
-                    self.state = SessionState.APPROVING
-                    self._refresh_streaming_view()
-                    try:
-                        await ev.approval.respond
-                    except asyncio.CancelledError:
-                        raise  # App 退出时取消本轮
-                    self.pending = None
-                    self.state = SessionState.STREAMING
+                    # 人在回路（F8）：切 APPROVING、暂停读事件，等用户决策。
+                    # ch15：与子 Agent 升级弹窗共用菜单锁（同一时刻最多一个弹窗），
+                    # 结束后恢复到进入前的状态（恒为 STREAMING——主循环暂停在工具执行中）
+                    async with self.approval_menu_lock:
+                        self._approval_prev_state = SessionState.STREAMING
+                        self.pending = ev.approval
+                        self.approve_cursor = 0
+                        self.state = SessionState.APPROVING
+                        self._refresh_streaming_view()
+                        try:
+                            await ev.approval.respond
+                        except asyncio.CancelledError:
+                            raise  # App 退出时取消本轮
+                        self.pending = None
+                        self.state = self._approval_prev_state
                     continue
                 if ev.err is not None:
                     self._finish_with_error(ev.err)
@@ -211,13 +215,13 @@ class StreamMixin:
             self._submit_approval(2)
 
     def _submit_approval(self, index: int) -> None:
-        """提交人在回路选择：回传 Outcome、清 pending、回 STREAMING 让 agent 续跑。"""
+        """提交人在回路选择：回传 Outcome、清 pending、恢复进入前的状态。"""
         req = self.pending
         if req is None:
             return
         self.pending = None
         self.approve_cursor = 0
-        self.state = SessionState.STREAMING
+        self.state = self._approval_prev_state  # 主 Agent=STREAMING；子 Agent=进入前状态
         req.respond.set_result(outcome_for_index(index))
         self._refresh_streaming_view()
 

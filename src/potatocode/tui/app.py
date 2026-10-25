@@ -38,6 +38,8 @@ from ..prompt import render_banner
 from ..session import SessionInfo, Writer
 from ..skills.executor import SkillExecutor
 from ..skills.loader import SkillLoader
+from ..subagent import Catalog as SubagentCatalog
+from ..task import Manager as TaskManager
 from ..tool import Registry
 from ..tool.load_skill import LoadSkill
 from .commands import CommandMixin
@@ -45,6 +47,7 @@ from .complete import CompletionMenu, CompletionMixin
 from .resume import ResumeSelect, do_resume_session
 from .select import ProviderSelect
 from .stream import StreamMixin
+from .tasks import TasksMixin
 from .view import (
     SessionState,
     ToolDisplay,
@@ -122,11 +125,12 @@ class ChatTextArea(TextArea):
         app.action_cancel_or_quit()
 
 
-class PotatoCodeApp(CompletionMixin, CommandMixin, StreamMixin, App):
+class PotatoCodeApp(CompletionMixin, CommandMixin, TasksMixin, StreamMixin, App):
     """PotatoCode 主应用。
 
     完成的消息（用户输入 / 助手回复 / 错误 / banner）持久追加到 RichLog，
     可滚动回看；动态区仅含「正在流式的回复 + 输入框 + 状态栏」。
+    ch15：负责后台任务通知与子 Agent 审批升级两个消费协程的宿主。
     """
 
     TITLE = "PotatoCode"
@@ -243,6 +247,8 @@ class PotatoCodeApp(CompletionMixin, CommandMixin, StreamMixin, App):
         load_skill_tool: LoadSkill | None = None,
         skill_catalog_text: str = "",
         hook_engine: HookEngine | None = None,
+        task_mgr: TaskManager | None = None,
+        subagent_catalog: SubagentCatalog | None = None,
     ) -> None:
         super().__init__()
         self.providers = providers
@@ -301,6 +307,14 @@ class PotatoCodeApp(CompletionMixin, CommandMixin, StreamMixin, App):
         self.turn_cancel: asyncio.Event | None = None  # 本轮取消事件（F7）
         self.pending: ApprovalRequest | None = None  # 待批准请求（APPROVING 态）
         self.approve_cursor: int = 0  # 待批准菜单光标（0/1/2）
+        # ch15：主 Agent 与子 Agent 升级弹窗共用一把菜单锁，同一时刻最多一个弹窗；
+        # 弹窗结束恢复到进入前的状态（主 Agent=STREAMING，后台子 Agent=IDLE）
+        self.approval_menu_lock = asyncio.Lock()
+        self._approval_prev_state: SessionState = SessionState.IDLE
+        # ch15 后台任务管理器与子 Agent 目录：cli 注入；未注入时相关协程不启动
+        self.task_mgr = task_mgr
+        self.subagent_catalog = subagent_catalog
+        self._task_consumers: list[asyncio.Task] = []  # 持引用防消费协程被回收
         self._stream_task: asyncio.Task | None = None
         self._timer: Timer | None = None
 
@@ -348,6 +362,16 @@ class PotatoCodeApp(CompletionMixin, CommandMixin, StreamMixin, App):
         else:
             self._enter_selecting()
         await self._dispatch_session_start()
+
+        # ch15：后台任务通知与子 Agent 审批升级的消费协程（task_mgr 未注入时不启动）
+        if self.task_mgr is not None:
+            self._task_consumers.append(asyncio.create_task(self._consume_task_done()))
+            self._task_consumers.append(asyncio.create_task(self._consume_subagent_approvals()))
+
+    @property
+    def main_agent(self) -> Agent | None:
+        """当前主 Agent（ch15 T29：Agent 工具经 getter 回填 parent 引用）。"""
+        return self.agent
 
     # ────────────────────── 状态切换 ──────────────────────
 
@@ -624,7 +648,7 @@ class PotatoCodeApp(CompletionMixin, CommandMixin, StreamMixin, App):
         if self.pending is not None:
             self.pending.respond.set_result(Outcome.DENY_ONCE)
         self.pending = None
-        self.state = SessionState.STREAMING
+        self.state = self._approval_prev_state  # ch15：恢复进入弹窗前的状态
         if self.turn_cancel is not None:
             self.turn_cancel.set()
         self._refresh_streaming_view()

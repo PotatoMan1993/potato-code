@@ -16,7 +16,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from .. import prompt
 from ..compact import (
@@ -53,7 +53,10 @@ from ..permission import Decision, Mode, Outcome
 from ..permission.engine import Engine
 from ..tool import DEFAULT_TIMEOUT, Registry
 from .event import CompactEvent, CompactPhase
-from .runtime import SessionRuntime, new_runtime
+from .runtime import SessionRuntime, new_runtime, new_sub_runtime
+
+if TYPE_CHECKING:
+    from .permission_upgrade import ApprovalUpgrader
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +74,10 @@ MAX_UNKNOWN_RUN: int = 3
 PLAN_REMINDER_INTERVAL: int = 4
 
 # 停止/收尾提示文案——既作为 Event(notice=...) 推给 UI，也作为历史兜底文本（F6）
-NOTICE_MAX_ITER = "（已达最大迭代轮数 25，自动停止；可继续发消息推进。）"
+# 迭代上限提示按实际轮数渲染（ch15 F9：子 Agent 的 max_turns 可 ≠ 25）
+NOTICE_MAX_ITER_TMPL = "（已达最大迭代轮数 {limit}，自动停止；可继续发消息推进。）"
+# 全局默认上限对应的提示文案（主 Agent 路径既有 UI 文案与断言保持不变）
+NOTICE_MAX_ITER = NOTICE_MAX_ITER_TMPL.format(limit=MAX_ITERATIONS)
 NOTICE_UNKNOWN_TOOLS = "（连续多轮只请求到未注册的工具，自动停止。）"
 NOTICE_STREAM_ERR = "（请求出错，本轮已中断。）"
 NOTICE_CANCELLED = "（已取消。）"
@@ -84,6 +90,12 @@ MEMORY_UPDATE_INTERVAL: int = 5
 
 # 显式记忆请求关键词：命中即额外触发一次更新，保证"记住 xxx"不被间隔漏掉（F35）
 MEMORY_SIGNAL_KEYWORDS: tuple[str, ...] = ("记住", "记忆", "别忘", "remember", "memo")
+
+# ch15：Agent 工具前台子 Agent 的等待上限；超时自动转后台（F17-②/AC10）
+AUTO_BACKGROUND_SECONDS: float = 120.0
+# Agent 工具在工具层（Registry.execute）的超时：前台等待 + 缓冲，避免 30s 默认
+# 超时把还没转后台的前台子 Agent 连带杀掉
+AGENT_TOOL_TIMEOUT: float = AUTO_BACKGROUND_SECONDS + 30.0
 
 
 class Phase(Enum):
@@ -158,10 +170,26 @@ class _BatchOutcome:
     completed: bool = True  # False：执行中被取消
 
 
+class MaxTurnsReached(Exception):
+    """子 Agent 触达 max_turns 迭代上限（ch15 F9）：`final_text` 携带最后一条 assistant 文本。"""
+
+    def __init__(self, final_text: str) -> None:
+        super().__init__("已达最大迭代轮数")
+        self.final_text = final_text
+
+
 def _preview(s: str, limit: int = _ARGS_PREVIEW_LIMIT) -> str:
     """参数预览：压缩换行、截断到 limit 字符，用于工具行展示。"""
     s = s.replace("\n", " ")
     return s if len(s) <= limit else s[:limit] + "…"
+
+
+def _forward_event(events: asyncio.Queue, event: Event) -> None:
+    """把进度事件放入转发队列（ch15 F16）；队列满时丢弃——进度类事件丢失不影响正确性。"""
+    try:
+        events.put_nowait(event)
+    except asyncio.QueueFull:
+        pass
 
 
 def _ensure_assistant_tail(conv: Conversation, fallback: str) -> None:
@@ -211,9 +239,7 @@ def _result_summary(content: str) -> str:
 
 def _hook_blocked_result(call_id: str, hook_name: str, reason: str) -> ToolResult:
     """hook 拦截的 tool_result（ch14 F32）：`[hook <name>] <reason>` 且 is_error=True。"""
-    return ToolResult(
-        tool_call_id=call_id, content=f"[hook {hook_name}] {reason}", is_error=True
-    )
+    return ToolResult(tool_call_id=call_id, content=f"[hook {hook_name}] {reason}", is_error=True)
 
 
 def has_memory_signal(msgs: list[Message]) -> bool:
@@ -256,11 +282,26 @@ class Agent:
         memory_text: str = "",
         skill_catalog: str = "",
         hook_engine: HookEngine | None = None,
+        # ── ch15 SubAgent 扩展（子 Agent 专属，主 Agent 全部走默认值，F10）──
+        system_prompt: str | None = None,  # 非空时覆盖默认 potatocode 系统提示
+        max_turns: int = 0,  # 本 Agent 迭代上限；0 = MAX_ITERATIONS（F9）
+        permission_mode: Mode | None = None,  # None = 调用方 run 时传 mode（主 Agent 语义）
+        dont_ask: bool = False,  # Ask 一律自动放行（dontAsk 角色，F12-②）
+        approval_upgrader: ApprovalUpgrader | None = None,  # Ask 升级父 TUI（F12-③/F13）
+        provider_override: Provider | None = None,  # model 覆盖时切换 provider（F10）
     ) -> None:
         self._provider = provider
+        if provider_override is not None:
+            self._provider = provider_override
         self._registry = registry
         self._version = version
         self.engine = engine  # 权限引擎：前四层判定，实际运行由 cli/tui 注入
+        # ch15 F10：子 Agent 构造选项原样保存，运行时按语义生效
+        self.system_prompt = system_prompt
+        self.max_turns = max_turns
+        self.permission_mode = permission_mode
+        self.dont_ask = dont_ask
+        self.approval_upgrader = approval_upgrader
         # 长生命周期状态由 TUI 跨轮持有；未注入时自建一份（测试与脚本场景）
         self.runtime = runtime if runtime is not None else new_runtime()
         # ch14 Hook 引擎：11 个生命周期时刻的事件分派；未注入时全部 emit 为空操作
@@ -283,6 +324,28 @@ class Agent:
         """更新 Available Skills 目录文本（启动期注入，reload / 安装后刷新，F11）。"""
         self._skill_catalog = catalog
 
+    # ────────────────── ch15：只读访问器（Agent 工具构造子 Agent 时取父依赖） ──────────────────
+
+    @property
+    def provider(self) -> Provider:
+        """当前 provider（子 Agent 沿用父 provider；model 覆盖切换时经构造参数替换）。"""
+        return self._provider
+
+    @property
+    def registry(self) -> Registry:
+        """工具注册中心（子 Agent 据此构建受限子注册中心，F30）。"""
+        return self._registry
+
+    @property
+    def version(self) -> str:
+        """应用版本号（子 Agent 环境段用）。"""
+        return self._version
+
+    @property
+    def hook_engine(self) -> HookEngine | None:
+        """Hook 引擎（子 Agent 沿用同一引擎，hook 在子 Agent 内同样分派）。"""
+        return self._hook_engine
+
     # ────────────────── ch14 Hook：事件分派与 reminder 装配 ──────────────────
 
     def _base_hook_payload(self, event: HookEvent, mode: Mode | None = None) -> HookPayload:
@@ -296,9 +359,7 @@ class Agent:
             payload["mode"] = mode.name.lower()
         return payload
 
-    async def _dispatch_hook(
-        self, event: HookEvent, payload: HookPayload
-    ) -> HookDispatchResult:
+    async def _dispatch_hook(self, event: HookEvent, payload: HookPayload) -> HookDispatchResult:
         """把一个生命周期事件交给 hook 引擎分派；未注入引擎时返回空结果（ch14 F31）。
 
         分派产生的注入 prompt 统一进 runtime 的 reminder 队列，由下一次
@@ -370,6 +431,64 @@ class Agent:
             )
             return out.before_tokens, out.after_tokens
 
+    async def run_to_completion(
+        self,
+        conv: Conversation,
+        task: str,
+        events: asyncio.Queue | None = None,
+    ) -> str:
+        """子 Agent 的「跑到底」循环（ch15 F5/F9）：模型不再调工具即结束。
+
+        与主对话 `run` 共用 `_run_iterations` 全部逻辑（权限判定、hook 分派、
+        上下文压缩、历史合法性收尾），区别仅在事件消费方式：不外吐事件流而是
+        内部消费——进度事件（text/tool/usage/iter）可经 `events` 队列转发给
+        TaskManager 聚合与 TUI 渲染；审批事件一律自动拒绝（无人值守安全默认；
+        Ask 已被 approval_upgrader 升级拦截时不会走到这里）。
+
+        返回最后一条 assistant 文本；触达 max_turns 抛 `MaxTurnsReached`（携带
+        final_text）；流出错把异常上抛（由 TaskManager 包成 failed，N3）。
+        `task` 为空串时不追加 user 消息（Fork / Skill fork 路径已预装填，F22）。
+        """
+        if task:
+            conv.add_user(task)
+        # ch15 F10：子 Agent 用角色 permission_mode 兜底；未设置（None）回退 DEFAULT
+        mode = self.permission_mode if self.permission_mode is not None else Mode.DEFAULT
+        cancel = asyncio.Event()  # 子 Agent 不消费主对话取消事件；取消经 task.cancel() 注入
+        limit = self.max_turns if self.max_turns > 0 else MAX_ITERATIONS
+        max_iter_notice = NOTICE_MAX_ITER_TMPL.format(limit=limit)
+        stream_err: Exception | None = None
+        reached_max_turns = False
+        try:
+            async for event in self._run_iterations(conv, mode, cancel):
+                if event.approval is not None:
+                    # 升级失败回落的审批自动拒绝，子 Agent 拿被拒结果自行调整（N3）
+                    if not event.approval.respond.done():
+                        event.approval.respond.set_result(Outcome.DENY_ONCE)
+                    continue
+                if events is not None:
+                    _forward_event(events, event)
+                if event.err is not None:
+                    stream_err = event.err
+                if event.notice == max_iter_notice:
+                    reached_max_turns = True
+        except asyncio.CancelledError:
+            # 被取消（TaskStop / 前台工具层终止）：先收尾历史保持合法（F6），异常继续上抛
+            _ensure_assistant_tail(conv, NOTICE_CANCELLED)
+            raise
+        if stream_err is not None:
+            raise stream_err
+        final_text = self._last_assistant_text(conv)
+        if reached_max_turns:
+            raise MaxTurnsReached(final_text)
+        return final_text
+
+    def _last_assistant_text(self, conv: Conversation) -> str:
+        """取对话中最后一条带文本的 assistant 消息（run_to_completion 的返回值，F9）。"""
+        for msg in reversed(conv.messages()):
+            if msg.role == ROLE_ASSISTANT and msg.content.strip():
+                return msg.content
+        return ""
+
     def _manage_input(
         self,
         conv: Conversation,
@@ -402,17 +521,22 @@ class Agent:
         cancel: asyncio.Event,
     ) -> AsyncIterator[Event]:
         """ReAct 主循环本体：每轮先管理上下文，再请求、执行工具、回灌结果。"""
-        # 每次 run 起始装配稳定系统提示（普通/规划一致；规划提醒已移出系统通道）
-        sys = prompt.build_system_prompt(
-            self._instruction_text, self._memory_text, self._skill_catalog
-        )
+        # ch15 F10：子 Agent 可携带角色 system prompt 覆盖默认装配（Fork 路径不设置以继承）
+        if self.system_prompt:
+            sys = self.system_prompt
+        else:
+            sys = prompt.build_system_prompt(
+                self._instruction_text, self._memory_text, self._skill_catalog
+            )
         if mode == Mode.PLAN:
             defs = self._registry.read_only_definitions()
         else:
             defs = self._registry.definitions()
 
+        # ch15 F9：迭代上限由 Agent.max_turns 决定（子 Agent 用角色定义，主 Agent 恒 25）
+        total_iterations = self.max_turns if self.max_turns > 0 else MAX_ITERATIONS
         unknown_run = 0
-        for it in range(1, MAX_ITERATIONS + 1):
+        for it in range(1, total_iterations + 1):
             yield Event(iter=it)
             # 环境段每轮迭代重建（F6）：git 状态等易变信息逐轮刷新
             env_text = prompt.gather_environment(self._version, self._provider.model).render()
@@ -637,13 +761,14 @@ class Agent:
                 yield Event(done=True)
                 return
 
-        # 循环走完：触达迭代上限（F2-2）
-        yield Event(notice=NOTICE_MAX_ITER)
-        _ensure_assistant_tail(conv, NOTICE_MAX_ITER)
+        # 循环走完：触达迭代上限（F2-2；ch15 F9 提示按实际轮数渲染）
+        max_iter_notice = NOTICE_MAX_ITER_TMPL.format(limit=total_iterations)
+        yield Event(notice=max_iter_notice)
+        _ensure_assistant_tail(conv, max_iter_notice)
         # ch14 Stop：迭代上限同样是自然停止路径（F9）
         await self._dispatch_hook(
             HookEvent.STOP,
-            self._base_hook_payload(HookEvent.STOP, mode) | {"iter": MAX_ITERATIONS},
+            self._base_hook_payload(HookEvent.STOP, mode) | {"iter": total_iterations},
         )
         yield Event(done=True)
 
@@ -839,38 +964,58 @@ class Agent:
                         )
                         completed = True
                     else:
-                        # 第五层人在回路（F8）：发事件 → await 用户决策
+                        # 第五层人在回路（F8）；ch15 F12：子 Agent 有两条新分支
                         # ch14 Notification：权限 Ask 弹出审批时（F9）
                         await self._dispatch_hook(
                             HookEvent.NOTIFICATION,
                             self._base_hook_payload(HookEvent.NOTIFICATION, mode)
                             | {"kind": "approval", "detail": calls[k].name},
                         )
-                        respond: asyncio.Future[Outcome] = (
-                            asyncio.get_running_loop().create_future()
-                        )
-                        yield Event(
-                            approval=ApprovalRequest(
-                                name=calls[k].name,
-                                args=_preview(calls[k].input),
-                                reason=reason,
-                                respond=respond,
-                            )
-                        )
-                        outcome = await respond
-                        if outcome is Outcome.ALLOW_FOREVER:
-                            try:
-                                self.engine.persist_local_allow(calls[k])
-                            except Exception as e:  # 持久化失败不阻断执行
-                                logger.warning("写入本地规则失败: %s", e)
+                        if self.dont_ask:
+                            # ch15 F12-②：子 Agent dontAsk 档——规则未命中的 Ask 一律放行
                             completed = await self._run_batch(calls, [k], results, cancel)
-                        elif outcome is Outcome.ALLOW_ONCE:
-                            completed = await self._run_batch(calls, [k], results, cancel)
-                        else:  # DENY_ONCE
-                            results[k] = ToolResult(
-                                tool_call_id=calls[k].id, content=reason, is_error=True
+                        else:
+                            respond: asyncio.Future[Outcome] = (
+                                asyncio.get_running_loop().create_future()
                             )
-                            completed = True
+                            outcome: Outcome | None = None
+                            if self.approval_upgrader is not None:
+                                # ch15 F12-③/F13：升级父 TUI 弹窗（标注「来自 SubAgent」），
+                                # 子 Agent 在此暂停等待；ok=False（无消费者）回退默认路径
+                                outcome, handled = await self.approval_upgrader(
+                                    ApprovalRequest(
+                                        name=calls[k].name,
+                                        args=_preview(calls[k].input),
+                                        reason=reason,
+                                        respond=respond,
+                                    )
+                                )
+                                if not handled:
+                                    outcome = None
+                            if outcome is None:
+                                # 默认 emit 路径：发事件 → await 用户决策（主 Agent 语义）
+                                yield Event(
+                                    approval=ApprovalRequest(
+                                        name=calls[k].name,
+                                        args=_preview(calls[k].input),
+                                        reason=reason,
+                                        respond=respond,
+                                    )
+                                )
+                                outcome = await respond
+                            if outcome is Outcome.ALLOW_FOREVER:
+                                try:
+                                    self.engine.persist_local_allow(calls[k])
+                                except Exception as e:  # 持久化失败不阻断执行
+                                    logger.warning("写入本地规则失败: %s", e)
+                                completed = await self._run_batch(calls, [k], results, cancel)
+                            elif outcome is Outcome.ALLOW_ONCE:
+                                completed = await self._run_batch(calls, [k], results, cancel)
+                            else:  # DENY_ONCE
+                                results[k] = ToolResult(
+                                    tool_call_id=calls[k].id, content=reason, is_error=True
+                                )
+                                completed = True
 
                 r = results[k]
                 assert r is not None
@@ -959,8 +1104,13 @@ class Agent:
         return True
 
     async def _run_tool(self, call: ToolCall) -> ToolResult:
-        """执行单个工具调用：受 per-tool 超时约束，恒返回结构化结果（N1）。"""
-        r = await self._registry.execute(call.name, call.input, timeout=DEFAULT_TIMEOUT)
+        """执行单个工具调用：受 per-tool 超时约束，恒返回结构化结果（N1）。
+
+        ch15：Agent 工具用加长超时（前台子 Agent 最长等 120s 后转后台），
+        其余工具沿用默认 30s。
+        """
+        timeout = AGENT_TOOL_TIMEOUT if call.name == "Agent" else DEFAULT_TIMEOUT
+        r = await self._registry.execute(call.name, call.input, timeout=timeout)
         await self._track_file_read(call, r.is_error)
         return ToolResult(tool_call_id=call.id, content=r.content, is_error=r.is_error)
 
@@ -1039,12 +1189,15 @@ class Agent:
 
 
 __all__ = [
+    "AGENT_TOOL_TIMEOUT",
+    "AUTO_BACKGROUND_SECONDS",
     "MAX_ITERATIONS",
     "MAX_UNKNOWN_RUN",
     "MEMORY_SIGNAL_KEYWORDS",
     "MEMORY_UPDATE_INTERVAL",
     "NOTICE_CANCELLED",
     "NOTICE_MAX_ITER",
+    "NOTICE_MAX_ITER_TMPL",
     "NOTICE_STREAM_ERR",
     "NOTICE_UNKNOWN_TOOLS",
     "PLAN_REMINDER_INTERVAL",
@@ -1054,6 +1207,7 @@ __all__ = [
     "CompactEvent",
     "CompactPhase",
     "Event",
+    "MaxTurnsReached",
     "Mode",
     "Phase",
     "SessionRuntime",
@@ -1061,5 +1215,6 @@ __all__ = [
     "Usage",
     "has_memory_signal",
     "new_runtime",
+    "new_sub_runtime",
     "recent_turn",
 ]

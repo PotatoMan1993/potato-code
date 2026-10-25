@@ -75,6 +75,8 @@ async def test_amain_registers_mcp_tools_and_closes_manager(monkeypatch):
             load_skill_tool=None,
             skill_catalog_text="",
             hook_engine=None,  # ch14：cli 装配注入 hook 引擎
+            task_mgr=None,  # ch15：cli 装配注入后台任务管理器与角色目录
+            subagent_catalog=None,
         ):
             observed["providers"] = providers
             observed["definitions"] = registry.definitions()
@@ -83,16 +85,30 @@ async def test_amain_registers_mcp_tools_and_closes_manager(monkeypatch):
             observed["mem_mgr"] = mem_mgr
             observed["instruction_text"] = instruction_text
             observed["sessions_dir"] = sessions_dir
+            observed["task_mgr"] = task_mgr
+            observed["subagent_catalog"] = subagent_catalog
 
         def rebind_skill_commands(self):
             observed["rebound"] = True
+
+        def ensure_agent(self):  # ch15：Agent 工具经 getter 回填 parent（惰性，桩恒 None）
+            return None
+
+        conv = None  # ch15：Agent 工具经 getter 取主对话
 
         mode = Mode.DEFAULT  # 退出兜底 SessionEnd 读当前模式（ch14 T22）
 
         async def run_async(self):
             observed["ran"] = True
 
-    monkeypatch.setattr(cli.config, "load", lambda path: SimpleNamespace(providers=["provider"]))
+    monkeypatch.setattr(
+        cli.config,
+        "load",
+        lambda path: SimpleNamespace(
+            providers=["provider"],
+            effective_enable_subagent_background=lambda: True,  # ch15 N6 配置面
+        ),
+    )
     monkeypatch.setattr(cli.mcp, "load_config", lambda root: "loaded-mcp-config")
     monkeypatch.setattr(cli.mcp, "new_manager", fake_new_manager)
     monkeypatch.setattr(cli.permission, "new_engine", lambda root: ("engine", None))
@@ -103,11 +119,14 @@ async def test_amain_registers_mcp_tools_and_closes_manager(monkeypatch):
     assert exit_code == 0
     assert observed["mcp_config"] == "loaded-mcp-config"
     assert observed["version"] == cli.__version__
-    # 6 个核心工具 + ch13 新增的 LoadSkill / InstallSkill + 1 个 MCP 远程工具
-    assert len(observed["definitions"]) == 9
+    # 6 个核心工具 + ch13 的 LoadSkill / InstallSkill + ch15 的 4 个 task 工具与 Agent
+    # 工具 + 1 个 MCP 远程工具
+    assert len(observed["definitions"]) == 14
     assert observed["definitions"][-1].name == "mcp__demo__echo"
     assert observed["ran"] is True
     assert manager.closed is True
+    assert observed["task_mgr"] is not None  # ch15：task_mgr / 角色目录注入 App
+    assert observed["subagent_catalog"] is not None
     # ch11：启动流程把存档写入器、记忆管理器与会话目录一起交给 TUI
     assert observed["writer"] is not None
     assert observed["mem_mgr"] is not None
@@ -125,10 +144,22 @@ async def test_amain_closes_manager_when_tui_fails(monkeypatch):
         def rebind_skill_commands(self):
             pass
 
+        def ensure_agent(self):  # ch15：Agent 工具回填 parent（惰性，桩恒 None）
+            return None
+
+        conv = None  # ch15：Agent 工具回填主对话
+
         async def run_async(self):
             raise RuntimeError("TUI failed")
 
-    monkeypatch.setattr(cli.config, "load", lambda path: SimpleNamespace(providers=[]))
+    monkeypatch.setattr(
+        cli.config,
+        "load",
+        lambda path: SimpleNamespace(
+            providers=[],
+            effective_enable_subagent_background=lambda: True,  # ch15 N6 配置面
+        ),
+    )
     monkeypatch.setattr(cli.mcp, "load_config", lambda root: "config")
 
     async def fake_new_manager(config, version):
