@@ -312,10 +312,7 @@ class Manager:
         try:
             self._done.put_nowait(task_id)
         except asyncio.QueueFull:
-            print(
-                f"task manager: done queue full, dropping notification for {task_id}",
-                file=sys.stderr,
-            )
+            logger.error(f"task manager: done queue full, dropping notification for {task_id}")
 
 
 __all__ = [

@@ -12,6 +12,7 @@ agent ↔ skills 循环依赖（spec 5）。ch15 起子 Agent 的构造与跑动
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 from typing import TYPE_CHECKING, Protocol
 
@@ -192,26 +193,35 @@ class SkillExecutor:
             context_messages = _pick_recent_main_messages(
                 host.skill_conversation().messages(), FORK_RECENT_MESSAGE_COUNT
             )
-        else:  # full：复用 compact 第 2 层摘要管道产出一段摘要（plan fork 分支 step 4）
-            summary_text = await self._summarize_main_conversation(host)
-            context_messages = (
-                [Message(role=ROLE_USER, content=f"## 主对话摘要\n\n{summary_text}")]
-                if summary_text
-                else []
-            )
 
-        # 上下文消息 + SOP 一起做一次角色规范化（合并连续同角色、去掉开头 assistant），
-        # 保证 fork 会话的 user/assistant 交替对两个协议都合法
-        normalized = _normalize_conversation_roles(
-            [*context_messages, Message(role=ROLE_USER, content=rendered_body)]
-        )
-        if not normalized:  # 防御：SOP 文本为空等极端情况
-            normalized = [Message(role=ROLE_USER, content=rendered_body)]
-        for normalized_message in normalized:
-            if normalized_message.role == ROLE_USER:
-                fork_conversation.add_user(normalized_message.content)
+            # 上下文消息 + SOP 一起做一次角色规范化（合并连续同角色、去掉开头 assistant），
+            # 保证 fork 会话的 user/assistant 交替对两个协议都合法
+            normalized = _normalize_conversation_roles(
+                [*context_messages, Message(role=ROLE_USER, content=rendered_body)]
+            )
+            if not normalized:  # 防御：SOP 文本为空等极端情况
+                normalized = [Message(role=ROLE_USER, content=rendered_body)]
+            for normalized_message in normalized:
+                if normalized_message.role == ROLE_USER:
+                    fork_conversation.add_user(normalized_message.content)
+                else:
+                    fork_conversation.add_assistant(normalized_message.content)
+        else:  # full：复用 compact 第 2 层摘要管道产出一段摘要（plan fork 分支 step 4）
+            # summary_text = await self._summarize_main_conversation(host)
+            # context_messages = (
+            #     [Message(role=ROLE_USER, content=f"## 主对话摘要\n\n{summary_text}")]
+            #     if summary_text
+            #     else []
+            # )
+
+            # full: 深拷贝全部历史message
+            context_messages = copy.deepcopy(host.skill_conversation().messages())
+
+            if context_messages and context_messages[-1].role == ROLE_USER:
+                context_messages[-1].content = f"{context_messages[-1].content}\n\n{rendered_body}"
             else:
-                fork_conversation.add_assistant(normalized_message.content)
+                context_messages.append(Message(role=ROLE_USER, content=rendered_body))
+            fork_conversation = Conversation.from_messages(context_messages)
         return fork_conversation
 
     async def _summarize_main_conversation(self, host: SkillHost) -> str:
@@ -265,7 +275,7 @@ def _pick_recent_main_messages(main_messages: list[Message], limit: int) -> list
 
 
 def _normalize_conversation_roles(messages: list[Message]) -> list[Message]:
-    """合并连续同角色文本消息并去掉开头非 user 消息，产出协议合法的 user/assistant 序列。"""
+    """合并连续同角色文本消息并去掉开头非 user 消息，产出协议合法的 user/assistant 序列。丢掉tool_call/tool_result对应的消息"""
     merged: list[Message] = []
     for message in messages:
         if message.role not in (ROLE_USER, ROLE_ASSISTANT) or not message.content.strip():
