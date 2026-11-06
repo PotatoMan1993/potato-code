@@ -14,3 +14,18 @@ hooks:
     action: 
       type: shell
       command: 'echo "禁止直接写入 JSON 文件，请使用专用工具" >&2; exit 2'
+
+  # - name: read-architecture-first
+  #   event: UserPromptSubmit
+  #   if: null
+  #   action:
+  #     type: prompt
+  #     text: 请先阅读 docs/architecture.md 了解项目结构，然后再开始工作。
+  #   only_once: true
+
+  # - name: update-architecture-end
+  #   event: SessionEnd
+  #   if: null
+  #   action:
+  #     type: prompt
+  #     text: 如果修改了代码，请更新 docs/architecture.md

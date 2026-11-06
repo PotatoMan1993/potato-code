@@ -128,7 +128,6 @@ async def _run(root: str, ses_ctx: SessionContext) -> int:
         engine, err = permission.new_engine(root)
         if err is not None:
             logger.warning("权限引擎降级: %s", err)
-            print(f"权限引擎降级: {err}", file=sys.stderr)
         # ch14 Hook 引擎：扫描两层 hooks.yaml；加载错误一律 stderr、不阻断启动（N1）
         hook_engine = hook.load(root)
         logger.info("已加载 %d 条 hook（来源：%s）", len(hook_engine.rules), hook_engine.sources)

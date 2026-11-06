@@ -74,10 +74,7 @@ class Engine:
 
             outcome = await self._executor.run(rule, payload, blocking=is_blocking(event))
             if outcome.err is not None:
-                print(
-                    f"[hook {rule.name}] {event.value} failed: {outcome.err}",
-                    file=sys.stderr,
-                )
+                logger.error(f"[hook {rule.name}] {event.value} failed: {outcome.err}")
                 self._mark_once_if_needed(rule)  # 执行过即算消耗一次 only_once
                 continue
             if outcome.prompt:

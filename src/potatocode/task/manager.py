@@ -282,6 +282,7 @@ class Manager:
                     background_task.usage.cache_write += event.usage.cache_write
                     background_task.usage.cache_read += event.usage.cache_read
         except asyncio.CancelledError:
+            logger.warning(f"任务 {background_task.id} 的事件消费任务被取消")
             pass  # 终态监视协程在收尾时取消本聚合
 
     async def _await_terminal(
@@ -297,11 +298,14 @@ class Manager:
             text = await handle
             background_task.result = text
             background_task.status = Status.COMPLETED
+            logger.info(f"任务 {background_task.id} 执行完成")
         except asyncio.CancelledError:
             background_task.status = Status.CANCELLED
+            logger.info(f"任务 {background_task.id} 被取消")
         except BaseException as error:  # noqa: BLE001 - 子 Agent 任何异常都不外泄（N3）
             background_task.status = Status.FAILED
             background_task.err = error
+            logger.info(f"任务 {background_task.id} 执行失败：{error}")
         finally:
             background_task.end_time = time.monotonic()
             aggregator.cancel()

@@ -182,14 +182,14 @@ def _validate_server(name: str, server: _RawServer) -> ServerConfig | None:
 def load_config(root: str) -> Config:
     """加载用户级与项目级 MCP 配置；所有错误均降级为告警。"""
     try:
-        user_path = Path.home() / ".potatocode" / "config.yaml"
+        user_path = Path.home() / ".potatocode" / "mcp_servers.yaml"
         user = _load_file(user_path)
     except Exception as exc:  # Path.home 等平台异常也不能阻断启动
         logger.warning(f"load user config failed: {exc}")
         user = {}
 
     try:
-        project = _load_file(Path(root) / ".potatocode.yaml")
+        project = _load_file(Path(root) / ".potatocode" / "mcp_servers.yaml")
     except Exception as exc:
         logger.warning(f"load project config failed: {exc}")
         project = {}

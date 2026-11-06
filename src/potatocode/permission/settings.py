@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import logging
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -12,6 +13,8 @@ import yaml
 from ..llm import ToolCall
 from .rule import RuleSet, parse_rule
 from .types import Category
+
+logger = logging.getLogger(__name__)
 
 
 class SettingsError(Exception):
@@ -166,13 +169,13 @@ def to_rule_set(s: Settings) -> RuleSet:
     for text in s.permissions.allow:
         rule, err = parse_rule(text)
         if rule is None:
-            print(f'rule {text!r} parse failed: {err}', file=sys.stderr)
+            logger.error(f'rule {text!r} parse failed: {err}', file=sys.stderr)
             continue
         rs.allow.append(rule)
     for text in s.permissions.deny:
         rule, err = parse_rule(text)
         if rule is None:
-            print(f'rule {text!r} parse failed: {err}', file=sys.stderr)
+            logger.error(f'rule {text!r} parse failed: {err}', file=sys.stderr)
             continue
         rs.deny.append(replace(rule, allow=False))
     return rs

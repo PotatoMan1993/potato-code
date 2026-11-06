@@ -172,7 +172,7 @@ async def _session_worker(
             tools = _adapt_tools(name, listed.tools, session)
             if not ready.done():
                 ready.set_result((session, tools))
-            await stop.wait()
+            await stop.wait()   # 阻塞不退出async with上下文，是为了让ClientSession对象存活，即与mcp server端保持连接
     except asyncio.CancelledError:
         if not ready.done():
             ready.cancel()

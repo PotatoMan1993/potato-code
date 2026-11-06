@@ -179,9 +179,9 @@ class MaxTurnsReached(Exception):
 
 
 def _preview(s: str, limit: int = _ARGS_PREVIEW_LIMIT) -> str:
-    """参数预览：压缩换行、截断到 limit 字符，用于工具行展示。"""
+    """参数预览：压缩换行、截断到 limit 字符，用于工具行展示。limit < 0 表示不截断"""
     s = s.replace("\n", " ")
-    return s if len(s) <= limit else s[:limit] + "…"
+    return s if limit < 0 or len(s) <= limit else s[:limit] + "…"
 
 
 def _forward_event(events: asyncio.Queue, event: Event) -> None:
@@ -814,9 +814,11 @@ class Agent:
             system=System(stable=sys, environment=env_text),
             reminder=reminder,
         )
-        logger.debug(f"Request system.stabel: {req.system.stable}")
+        logger.debug(f"Request system.stable: {req.system.stable}")
         logger.debug(f"Request system.environment: {req.system.environment}")
         logger.debug(f"Request messages: {'\n'.join([str(e) for e in req.messages])}")
+        logger.debug(f"Request reminder: {reminder}")
+        logger.debug(f"Request tools: {' - '.join(e.name for e in req.tools)}")
         async for ev in self._provider.stream(req):
             if cancel.is_set():
                 yield _StreamOutcome(ok=False)
@@ -874,7 +876,7 @@ class Agent:
                     yield Event(
                         tool=ToolEvent(
                             name=calls[k].name,
-                            args=_preview(calls[k].input),
+                            args=_preview(calls[k].input, -1),
                             phase=Phase.START,
                         )
                     )
@@ -921,7 +923,7 @@ class Agent:
                     yield Event(
                         tool=ToolEvent(
                             name=calls[k].name,
-                            args=_preview(calls[k].input),
+                            args=_preview(calls[k].input, -1),
                             phase=Phase.END,
                             result=r.content,
                             is_error=r.is_error,
@@ -934,7 +936,7 @@ class Agent:
                 yield Event(
                     tool=ToolEvent(
                         name=calls[k].name,
-                        args=_preview(calls[k].input),
+                        args=_preview(calls[k].input, -1),
                         phase=Phase.START,
                     )
                 )
@@ -985,7 +987,7 @@ class Agent:
                                 outcome, handled = await self.approval_upgrader(
                                     ApprovalRequest(
                                         name=calls[k].name,
-                                        args=_preview(calls[k].input),
+                                        args=_preview(calls[k].input, -1),
                                         reason=reason,
                                         respond=respond,
                                     )
@@ -997,7 +999,7 @@ class Agent:
                                 yield Event(
                                     approval=ApprovalRequest(
                                         name=calls[k].name,
-                                        args=_preview(calls[k].input),
+                                        args=_preview(calls[k].input, -1),
                                         reason=reason,
                                         respond=respond,
                                     )
@@ -1033,7 +1035,7 @@ class Agent:
                 yield Event(
                     tool=ToolEvent(
                         name=calls[k].name,
-                        args=_preview(calls[k].input),
+                        args=_preview(calls[k].input, -1),
                         phase=Phase.END,
                         result=r.content,
                         is_error=r.is_error,
