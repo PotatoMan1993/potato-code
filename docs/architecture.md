@@ -308,7 +308,7 @@ Agent 类新增 6 个构造参数（主 Agent 全部走默认值，行为不变�
 - **分发**（`command/dispatch.py: parse_with_args`）：`/` 开头走命令路径；参数尾巴只有命令声明 accepts_args 才消费，否则按未命中；未命中输出「输入 /help 查看可用命令」引导；大小写不敏感
 - **桥接与守护**（`tui/commands.py: CommandMixin.dispatch_slash`）：UI / PROMPT 类命令仅 IDLE 态可执行（`/exit` 例外）；handler 异常捕获后以错误样式输出，不打断 TUI
 - **UI Protocol**（`command/ui.py`）：handler 操作界面的唯一通道——输出（println / error）、权限模式读写、`inject_and_send` 提示词注入、只读查询（token / 模型 / 工具数 / 记忆文件 / 会话路径）、影响界面动作（quit / force_compact / open_resume_menu / clear_and_new_session）、hook 查询、skill 支持；附 `NopUI` 测试桩
-- **命令清单**：13 条内置（ch12 的 clear / compact / do / exit / help / memory / permission / plan / resume / review / session / status + ch14 的 hooks，`command/builtins.py`）+ `/skill` 管理命令（ch13，accepts_args：list / info \<name\> / reload）+ **每个 skill 一条同名斜杠命令**（描述带 `[skill]` 后缀；inline 注册为 PROMPT、fork 注册为 UI；与内置命令同名时 skill 覆盖——unregister 后重注册，reload 幂等重建）
+- **命令清单**：13 条内置（ch12 的 clear / compact / do / exit / help / memory / permission / plan / resume / review / session / status + ch14 的 hooks，`command/builtins.py`）+ `/skill` 管理命令（ch13，accepts_args：list / info \<name\> / reload）+ **每个 skill 一条同名斜杠命令**（描述前缀 `[skill] `；inline 注册为 PROMPT、fork 注册为 UI；与内置命令同名时 skill 覆盖——unregister 后重注册，reload 幂等重建）
 - **补全菜单**（`tui/complete.py: CompletionMenu`）：输入以 `/` 开头即激活，按 `prefix_match` 实时过滤候选；↑↓ / Tab / 回车 / ESC 全键位、8 行滚动窗口、零匹配显示占位提示；任何提交先关菜单
 
 ---
@@ -327,7 +327,7 @@ Agent 类新增 6 个构造参数（主 Agent 全部走默认值，行为不变�
 - **Available Skills 目录**（`prompt/skills_block.py`）：系统提示 90 槽渲染 `- name: description` 清单 + LoadSkill 调用指引；启动期注入，/skill reload 与安装后经 `agent.set_skill_catalog` 刷新
 - **LoadSkill 工具**（`tool/load_skill.py`）：read-only——不弹权限提示、PLAN 模式可用；宿主依赖经 `SkillHost` 窄协议注入，tool 包不反向依赖 TUI
 - **InstallSkill 工具**（`tool/install_skill.py` → `skills/install.py`）：用户把 URL 发给 Agent 即自动安装到 `~/.potatocode/skills/<name>/`；支持 skills.sh / github tree / raw 三种 URL，一律走 GitHub Contents API 递归拉取（raw 媒体类型取文件内容，download_url 仅回退）；限额单文件 ≤1MiB / 总量 ≤8MiB / 文件数 ≤64 / 深度 ≤4；先暂存到安装根的兄弟 tempdir、验证含 SKILL.md 后原子改名落位；装完自动 rebind（重建斜杠命令 + 刷新 Agent 目录），无需重启
-- **fork 隔离**（`skills/executor.py`）：独立 Conversation + 全新 SessionRuntime（沿用主会话 id 但不挂 writer、不落盘）+ 剔除 LoadSkill 的子 Registry（防递归加载）；fork 内权限询问一律自动拒绝（无人值守安全默认）；`context` 档——none 空 / recent 最近 5 条纯文本（跳过带工具调用的回合）/ full 复用 compact 第 2 层摘要管道；上下文 + SOP 做角色规范化（合并连续同角色、去开头 assistant）保证历史合法；宿主能力面全部经 `SkillHost` 协议注入
+- **fork 隔离**（`skills/executor.py`）：独立 Conversation + 全新 SessionRuntime（沿用主会话 id 但不挂 writer、不落盘）+ 剔除 LoadSkill 的子 Registry（防递归加载）；fork 内权限询问一律自动拒绝（无人值守安全默认）；`context` 档——none 空 / recent 最近 5 条纯文本（跳过带工具调用的回合）/ full 深拷贝主对话全部历史并把 SOP 追加为末条 user 消息；上下文 + SOP 做角色规范化（合并连续同角色、去开头 assistant）保证历史合法；宿主能力面全部经 `SkillHost` 协议注入
 
 ---
 
@@ -422,7 +422,7 @@ Agent 类新增 6 个构造参数（主 Agent 全部走默认值，行为不变�
 | 文件 | 用途 | 要点 |
 |---|---|---|
 | `.potatocode/config.yaml`（模板 config.yaml.example） | providers + 开关 | name / protocol(anthropic\|openai) / api_key / model / base_url? / thinking? / context_window?（0=协议默认 200000 / 128000，决定压缩阈值）；顶层 `enable_subagent_background?`（ch15 N6，默认 true，false 时所有子 Agent 强制前台） |
-| `.potatocode.yaml`（项目根，用户级 `~/.potatocode/config.yaml`） | MCP servers | type(stdio\|http)；env / headers 支持 `${VAR}` 环境变量展开；同名 server 项目级完整覆盖用户级 |
+| `.potatocode/mcp_servers.yaml`（用户级 `~/.potatocode/mcp_servers.yaml`） | MCP servers | type(stdio\|http)；env / headers 支持 `${VAR}` 环境变量展开；同名 server 项目级完整覆盖用户级 |
 | `.potatocode/settings(.local).yaml`（用户级 `~/.potatocode/settings.yaml`） | 权限 | default_mode（default / acceptEdits / plan / bypassPermissions）+ permissions.allow / deny；规则串四式语法 `Bash(=精确)` / `Bash(~正则)` / `Bash(!反向)` / `Bash(glob)`（ch14）；三级：用户 > 项目 > 本地，「永久允许」自动写入 local |
 | `.potatocode/hooks.yaml`（用户级 `~/.potatocode/hooks.yaml`） | hooks（ch14） | `hooks:` 数组：name / event(11 选 1) / if?(all_of\|any_of + field/match) / action(shell\|prompt\|http\|subagent) / only_once? / async? / timeout?；两层叠加合并 |
 
@@ -437,6 +437,8 @@ Agent 类新增 6 个构造参数（主 Agent 全部走默认值，行为不变�
 ├── memory/                            # 项目级笔记库 + MEMORY.md 索引
 ├── skills/                            # 项目级 skill 目录（<name>.md 或 <name>/SKILL.md）
 ├── agents/*.md                        # 项目级 Agent 角色定义（ch15，frontmatter+正文）
+├── config.yaml                        # provider 配置（含密钥，已被 gitignore）
+├── mcp_servers.yaml                   # MCP server 配置
 ├── hooks.yaml                         # 项目级 hook 规则
 └── settings.local.yaml                # 「永久允许」自动写入
 ~/.potatocode/                         # 用户级：config.yaml / settings.yaml / hooks.yaml / memory/ / skills/ / agents/

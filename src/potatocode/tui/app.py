@@ -348,7 +348,7 @@ class PotatoCodeApp(CompletionMixin, CommandMixin, TasksMixin, StreamMixin, App)
         """
         log = self.query_one("#log", RichLog)
         title = Text()
-        title.append(render_banner(self._version, os.getcwd()), style="cyan")
+        title.append(render_banner(self._version, self.workspace), style="cyan")
         if self.manager is not None:  # 未注入 manager 的场景（单测）不展示 MCP 统计
             title.append(
                 f"\n  Connected to {len(self.manager._sessions)} MCP server(s)", style="dim"

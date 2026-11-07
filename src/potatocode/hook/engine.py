@@ -9,8 +9,8 @@ dispatch 按加载声明顺序串行执行命中事件的规则；async hook 起
 from __future__ import annotations
 
 import asyncio
-import sys
 import logging
+import sys
 from dataclasses import dataclass, field
 
 from .event import Event, is_blocking
@@ -74,7 +74,9 @@ class Engine:
 
             outcome = await self._executor.run(rule, payload, blocking=is_blocking(event))
             if outcome.err is not None:
-                logger.error(f"[hook {rule.name}] {event.value} failed: {outcome.err}")
+                message = f"[hook {rule.name}] {event.value} failed: {outcome.err}"
+                logger.error(message)
+                print(message, file=sys.stderr)
                 self._mark_once_if_needed(rule)  # 执行过即算消耗一次 only_once
                 continue
             if outcome.prompt:

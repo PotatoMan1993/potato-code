@@ -36,8 +36,8 @@ def log_path(tmp_path) -> Callable[..., Path]:
     logger.propagate = original_propagate
 
 
-def test_default_level_keeps_info_drops_debug(log_path):
-    """默认详细度为信息级：信息级落盘，调试级被过滤。"""
+def test_default_level_keeps_debug(log_path):
+    """默认详细度为调试级：信息级与调试级都落盘。"""
     path = log_path()
     setup_logging(str(path), None)
 
@@ -47,7 +47,7 @@ def test_default_level_keeps_info_drops_debug(log_path):
 
     text = path.read_text(encoding="utf-8")
     assert "信息级消息" in text
-    assert "调试级消息" not in text
+    assert "调试级消息" in text
 
 
 def test_explicit_debug_level_keeps_debug(log_path):
@@ -74,15 +74,15 @@ def test_env_var_raises_level_without_code_change(log_path, monkeypatch):
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        (None, logging.INFO),
+        (None, logging.DEBUG),
         ("debug", logging.DEBUG),
         ("  WARNING ", logging.WARNING),
-        ("bogus", logging.INFO),
-        (123, logging.INFO),
+        ("bogus", logging.DEBUG),
+        (123, logging.DEBUG),
     ],
 )
 def test_resolve_level(raw, expected):
-    """级别名解析：大小写与空白不敏感，非法或缺省值回落到信息级。"""
+    """级别名解析：大小写与空白不敏感，非法或缺省值回落到默认调试级。"""
     assert resolve_level(raw) == expected
 
 

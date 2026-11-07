@@ -7,9 +7,9 @@ potatocode 启动（ch14 N1/N9）。两层（项目级 + 用户级）规则叠�
 
 from __future__ import annotations
 
+import logging
 import re
 import sys
-import logging
 from pathlib import Path
 
 import yaml
@@ -31,6 +31,13 @@ from .rule import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _report_error(message: str) -> None:
+    """加载期错误：同时写 session.log 与 stderr，调用方随后跳过该文件/规则（N1/N9）。"""
+    logger.error(message)
+    print(message, file=sys.stderr)
+
 
 # 有效的 match.type 字面量（ch14 F14）
 _MATCH_TYPES = {"exact", "glob", "regex", "not"}
@@ -67,11 +74,11 @@ def load(project_root: str | Path) -> Engine:
                 hook_name = (
                     raw_rule.get("name") if isinstance(raw_rule, dict) else None
                 ) or f"#{idx}"
-                logger.error(f'hook "{hook_name}": {err}, skipped')
+                _report_error(f'hook "{hook_name}": {err}, skipped')
                 continue
             if compiled.name in seen_names:
                 # 同名 hook 冲突：保留先到者、跳过后到者（ch14 F7）
-                logger.error(
+                _report_error(
                     f'hook "{compiled.name}": duplicate name across files, '
                     f"skipped later rule from {compiled.source}"
                 )
@@ -86,12 +93,14 @@ def _read_hook_file(hook_file: Path) -> list | None:
     try:
         raw = yaml.safe_load(hook_file.read_text(encoding="utf-8"))
     except (yaml.YAMLError, OSError) as e:
-        logger.error(f"hooks.yaml parse failed: {hook_file}: {e}")
+        _report_error(f"hooks.yaml parse failed: {hook_file}: {e}")
         return None
     if raw is None:
         return []
     if not isinstance(raw, dict) or not isinstance(raw.get("hooks"), list):
-        logger.error(f"hooks.yaml structure invalid (expected top-level `hooks:` list): {hook_file}")
+        _report_error(
+            f"hooks.yaml structure invalid (expected top-level `hooks:` list): {hook_file}"
+        )
         return None
     return raw["hooks"]
 
@@ -162,7 +171,7 @@ def _compile_condition(name: str, raw: object) -> tuple[Condition | None, str | 
         # 顶层混用两种组合按加载错误处理（ch14 F11/G5）
         return None, "`if` cannot contain both `all_of` and `any_of`"
     if not has_all and not has_any:
-        return None, '`if` must contain exactly one of `all_of` / `any_of`'
+        return None, "`if` must contain exactly one of `all_of` / `any_of`"
     mode = CombineMode.ALL_OF if has_all else CombineMode.ANY_OF
     raw_atoms = raw.get("all_of" if has_all else "any_of")
     if not isinstance(raw_atoms, list) or not raw_atoms:

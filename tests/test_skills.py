@@ -21,7 +21,7 @@ from potatocode.command import Registry as CommandRegistry
 from potatocode.command.builtin_skill import register_skill_manage_command
 from potatocode.command.command import Command, Kind
 from potatocode.command.skill_register import (
-    SKILL_COMMAND_DESCRIPTION_SUFFIX,
+    SKILL_COMMAND_DESCRIPTION_PREFIX,
     build_skill_catalog_text,
     register_skill_commands,
 )
@@ -428,12 +428,12 @@ class TestSkillExecutorFork:
         assert all(call.tools == [] for call in provider.requests)
 
     @pytest.mark.asyncio
-    async def test_fork_context_full_prepends_summary(self, tmp_path: Path) -> None:
+    async def test_fork_context_full_copies_main_history(self, tmp_path: Path) -> None:
+        """full 档：深拷贝主对话历史，并把 SOP 追加为末条 user 消息。"""
         main_conv = Conversation()
         main_conv.add_user("user asked something")
         main_conv.add_assistant("assistant answered")
         provider = ScriptedProvider([
-            [StreamEvent(text="MAIN SUMMARY"), StreamEvent(done=True)],  # 摘要请求
             [StreamEvent(text="FORK DONE"), StreamEvent(done=True)],  # fork 主请求
         ])
         host = FakeHost(tmp_path, provider=provider, conversation=main_conv)
@@ -441,9 +441,12 @@ class TestSkillExecutorFork:
         skill = SkillDef(name="fk", description="d", prompt_body="GO", mode="fork", context="full")
         final_text = await executor.execute_fork(skill, "", host)
         assert final_text == "FORK DONE"
-        # 第 2 个请求（fork 主跑）的历史里应带上摘要消息 + SOP
-        fork_messages = provider.requests[1].messages
-        assert any("MAIN SUMMARY" in message.content for message in fork_messages)
+        # fork 主跑的历史应完整继承主对话，末条 user 消息带 SOP
+        fork_messages = provider.requests[0].messages
+        assert [message.content for message in fork_messages[:2]] == [
+            "user asked something",
+            "assistant answered",
+        ]
         assert fork_messages[-1].role == "user"
         assert "GO" in fork_messages[-1].content
 
@@ -603,7 +606,7 @@ class TestSkillsCatalogBlock:
 
 
 class TestRegisterSkillCommands:
-    def test_each_skill_becomes_command_with_skill_suffix(self, tmp_path: Path) -> None:
+    def test_each_skill_becomes_command_with_skill_prefix(self, tmp_path: Path) -> None:
         loader = make_loader(tmp_path)
         skills_dir = tmp_path / "ws" / ".potatocode" / "skills"
         write_skill_file(skills_dir / "alpha.md", name="alpha")
@@ -613,7 +616,7 @@ class TestRegisterSkillCommands:
         register_skill_commands(reg, loader, SkillExecutor(loader))
         alpha_cmd = reg.lookup("alpha")
         assert alpha_cmd is not None
-        assert alpha_cmd.description.endswith(SKILL_COMMAND_DESCRIPTION_SUFFIX)
+        assert alpha_cmd.description.startswith(SKILL_COMMAND_DESCRIPTION_PREFIX)
         assert alpha_cmd.kind is Kind.PROMPT  # inline 走提示词注入
         forky_cmd = reg.lookup("forky")
         assert forky_cmd is not None
@@ -646,7 +649,7 @@ class TestRegisterSkillCommands:
         review_cmd = reg.lookup("review")
         assert review_cmd is not None
         assert "builtin" not in review_cmd.description
-        assert review_cmd.description.endswith("[skill]")
+        assert review_cmd.description.startswith("[skill]")
 
     def test_build_skill_catalog_text(self, tmp_path: Path) -> None:
         loader = make_loader(tmp_path)

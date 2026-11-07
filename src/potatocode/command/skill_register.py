@@ -1,6 +1,6 @@
 """把 skill 目录清单注册为斜杠命令（ch13 F12/F14）。
 
-每个 skill 一条 `/ <name>` 命令，描述末尾标注 `[skill]`；mode 决定运行时分支：
+每个 skill 一条 `/ <name>` 命令，描述开头标注 `[skill]`；mode 决定运行时分支：
 inline 把 SOP（$ARGUMENTS 已渲染）作为 user 消息注入并触发本轮，fork 后台子
 Agent 跑完后把结果作为 assistant 消息回流主对话（executor.spawn_fork）。
 模块级 `_REGISTERED_SKILL_NAMES` 跟踪本会话已注册的 skill 命令，reload 时先
@@ -24,8 +24,8 @@ logger = logging.getLogger(__name__)
 # 本会话已注册为斜杠命令的 skill 名（reload 时据此清旧，避免重复注册冲突）
 _REGISTERED_SKILL_NAMES: set[str] = set()
 
-# skill 命令描述的统一后缀（/help 与补全菜单里标识 skill 来源）
-SKILL_COMMAND_DESCRIPTION_SUFFIX = "[skill] "
+# skill 命令描述的统一前缀（/help 与补全菜单里标识 skill 来源）
+SKILL_COMMAND_DESCRIPTION_PREFIX = "[skill] "
 
 
 def register_skill_commands(reg: Registry, loader: SkillLoader, executor: SkillExecutor) -> None:
@@ -49,7 +49,7 @@ def register_skill_commands(reg: Registry, loader: SkillLoader, executor: SkillE
         reg.register(
             Command(
                 name=skill.name,
-                description=f"{SKILL_COMMAND_DESCRIPTION_SUFFIX}{skill.description}",
+                description=f"{SKILL_COMMAND_DESCRIPTION_PREFIX}{skill.description}",
                 kind=command_kind,
                 handler=handler,
             )
@@ -104,6 +104,7 @@ def _make_fork_skill_handler(
             ui.error("尚未选定 provider，无法执行 skill")
             return
         executor.spawn_fork(skill, "", ui)
+
     return _handler
 
 

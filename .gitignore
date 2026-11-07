@@ -13,6 +13,10 @@ __pycache__/
 # PotatoCode 运行配置（含真实密钥，N5）
 .potatocode/config.yaml
 
+# 本机专属配置：权限「永久允许」与本机 Claude Code 权限，不随仓库分发
+.potatocode/settings.local.yaml
+.claude/settings.local.json
+
 # 会话落盘目录（工具结果预览体原文，调试副产物）
 .potatocode/sessions/
 

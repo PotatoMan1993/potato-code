@@ -1,4 +1,4 @@
-# 项目级放 <root>/.potatocode.yaml；用户级放 ~/.potatocode/config.yaml。
+# 项目级放 <root>/.potatocode/mcp_servers.yaml；用户级放 ~/.potatocode/mcp_servers.yaml。
 # 同名 server 项目级完整覆盖用户级。
 # env / headers 的值支持 ${VAR} 从宿主环境变量展开；command/args 不展开。
 mcp_servers:
@@ -22,5 +22,5 @@ mcp_servers:
     command: npx
     args: ["-y", "@upstash/context7-mcp"]
     env:
-      # CONTEXT7_API_KEY: "${CONTEXT7_API_KEY}"
-      CONTEXT7_API_KEY: "ctx7sk-b7e0f91c-7b69-45b6-aa1e-1b3db44951f0"
+      # 密钥从宿主环境变量读取，勿把真实 key 写进仓库
+      CONTEXT7_API_KEY: "${CONTEXT7_API_KEY}"

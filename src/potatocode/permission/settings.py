@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
-import sys
 import logging
+import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -169,16 +169,23 @@ def to_rule_set(s: Settings) -> RuleSet:
     for text in s.permissions.allow:
         rule, err = parse_rule(text)
         if rule is None:
-            logger.error(f'rule {text!r} parse failed: {err}', file=sys.stderr)
+            _report_parse_failure(text, err)
             continue
         rs.allow.append(rule)
     for text in s.permissions.deny:
         rule, err = parse_rule(text)
         if rule is None:
-            logger.error(f'rule {text!r} parse failed: {err}', file=sys.stderr)
+            _report_parse_failure(text, err)
             continue
         rs.deny.append(replace(rule, allow=False))
     return rs
+
+
+def _report_parse_failure(text: str, err: str | None) -> None:
+    """规则解析失败：同时写 session.log 与 stderr，然后跳过该条（ch14 F4）。"""
+    message = f"rule {text!r} parse failed: {err}"
+    logger.error(message)
+    print(message, file=sys.stderr)
 
 
 __all__ = [

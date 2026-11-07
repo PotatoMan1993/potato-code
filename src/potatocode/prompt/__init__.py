@@ -56,7 +56,7 @@ def render_banner(version: str, cwd: str) -> str:
         f"  PotatoCode v{version}\n"
         f"  cwd: {cwd}\n"
         f"\n"
-        f"  Ready. 输入消息开始对话（Enter 发送 · Alt+Enter 换行 · 输入 /help 查看可用命令）\n"
+        f"  Ready. 输入消息开始对话（Enter 发送 · Alt+Enter 换行 · /help 查看可用命令）\n"
     )
 
 

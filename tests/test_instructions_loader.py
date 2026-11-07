@@ -38,9 +38,9 @@ def _write(path: Path, text: str) -> Path:
 def test_three_layers_merged_in_priority_order(tmp_path):
     """三层都有文件时按「项目根 → .potatocode → 用户级」顺序拼接（AC1）。"""
     project, home = _layout(tmp_path)
-    _write(project / "MEWCODE.md", "项目级")
-    _write(project / ".potatocode" / "MEWCODE.md", "项目配置级")
-    _write(home / ".potatocode" / "MEWCODE.md", "用户级")
+    _write(project / "POTATOCODE.md", "项目级")
+    _write(project / ".potatocode" / "POTATOCODE.md", "项目配置级")
+    _write(home / ".potatocode" / "POTATOCODE.md", "用户级")
 
     text = _loader(project, home).load()
 
@@ -50,7 +50,7 @@ def test_three_layers_merged_in_priority_order(tmp_path):
 def test_missing_layers_are_silent(tmp_path):
     """只有项目根有文件时加载成功，不报错、不含其他层内容（AC2）。"""
     project, home = _layout(tmp_path)
-    _write(project / "MEWCODE.md", "只有项目级")
+    _write(project / "POTATOCODE.md", "只有项目级")
 
     assert _loader(project, home).load() == "只有项目级"
 
@@ -65,7 +65,7 @@ def test_no_instruction_files_returns_empty(tmp_path):
 def test_empty_file_yields_empty(tmp_path):
     """空指令文件产出空内容，不影响拼接（F6）。"""
     project, home = _layout(tmp_path)
-    _write(project / "MEWCODE.md", "   \n\n")
+    _write(project / "POTATOCODE.md", "   \n\n")
 
     assert _loader(project, home).load() == ""
 
@@ -76,7 +76,7 @@ def test_empty_file_yields_empty(tmp_path):
 def test_include_replaces_line(tmp_path):
     """独占一行的 @include 被引用文件内容替换（AC3）。"""
     project, home = _layout(tmp_path)
-    _write(project / "MEWCODE.md", "头部\n@include rules/style.md\n尾部")
+    _write(project / "POTATOCODE.md", "头部\n@include rules/style.md\n尾部")
     _write(project / "rules" / "style.md", "规则内容")
 
     assert _loader(project, home).load() == "头部\n规则内容\n尾部"
@@ -85,7 +85,7 @@ def test_include_replaces_line(tmp_path):
 def test_nested_include(tmp_path):
     """A include B、B include C → A 的输出包含 C 的内容。"""
     project, home = _layout(tmp_path)
-    _write(project / "MEWCODE.md", "@include b.md")
+    _write(project / "POTATOCODE.md", "@include b.md")
     _write(project / "b.md", "B 的内容\n@include c.md")
     _write(project / "c.md", "C 的内容")
 
@@ -97,7 +97,7 @@ def test_nested_include(tmp_path):
 def test_include_path_relative_to_current_file(tmp_path):
     """@include 路径相对当前文件所在目录解析（子目录里的相对引用）。"""
     project, home = _layout(tmp_path)
-    _write(project / "MEWCODE.md", "@include sub/a.md")
+    _write(project / "POTATOCODE.md", "@include sub/a.md")
     _write(project / "sub" / "a.md", "@include deep/b.md")
     _write(project / "sub" / "deep" / "b.md", "深层内容")
 
@@ -107,7 +107,7 @@ def test_include_path_relative_to_current_file(tmp_path):
 def test_max_depth_truncates_sixth_layer(tmp_path):
     """6 层嵌套链的第 6 层不展开，输出出现深度警告（AC4/F3）。"""
     project, home = _layout(tmp_path)
-    _write(project / "MEWCODE.md", "@include d2.md")
+    _write(project / "POTATOCODE.md", "@include d2.md")
     for level in range(2, 6):  # d2 → d3 → d4 → d5
         _write(project / f"d{level}.md", f"第{level}层\n@include d{level + 1}.md")
     _write(project / "d6.md", "第6层不应出现")
@@ -123,8 +123,8 @@ def test_max_depth_truncates_sixth_layer(tmp_path):
 def test_cycle_detected(tmp_path):
     """A include B、B include A → 第二次引用不展开，出现环路警告（AC5/F4）。"""
     project, home = _layout(tmp_path)
-    _write(project / "MEWCODE.md", "A 的内容\n@include b.md")
-    _write(project / "b.md", "B 的内容\n@include MEWCODE.md")
+    _write(project / "POTATOCODE.md", "A 的内容\n@include b.md")
+    _write(project / "b.md", "B 的内容\n@include POTATOCODE.md")
 
     text = _loader(project, home).load()
 
@@ -137,7 +137,7 @@ def test_path_escape_rejected(tmp_path):
     """项目级指令引用根边界外的文件 → 不加载，出现范围警告（AC6/F5）。"""
     project, home = _layout(tmp_path)
     _write(tmp_path / "outside.md", "越界内容")
-    _write(project / "MEWCODE.md", "@include ../outside.md")
+    _write(project / "POTATOCODE.md", "@include ../outside.md")
 
     text = _loader(project, home).load()
 
@@ -148,7 +148,7 @@ def test_path_escape_rejected(tmp_path):
 def test_user_layer_boundary_is_user_potatocode(tmp_path):
     """用户级文件的根边界是 ~/.potatocode/：引用同目录内文件可以，跳出去不行。"""
     project, home = _layout(tmp_path)
-    user_md = home / ".potatocode" / "MEWCODE.md"
+    user_md = home / ".potatocode" / "POTATOCODE.md"
     _write(user_md, "@include shared.md\n@include ../secret.md")
     _write(home / ".potatocode" / "shared.md", "用户级可读")
     _write(home / "secret.md", "越界内容")
@@ -163,7 +163,7 @@ def test_user_layer_boundary_is_user_potatocode(tmp_path):
 def test_missing_include_is_silent(tmp_path):
     """被引用文件不存在 → 该行静默消失，不报错（F6）。"""
     project, home = _layout(tmp_path)
-    _write(project / "MEWCODE.md", "头部\n@include not-there.md\n尾部")
+    _write(project / "POTATOCODE.md", "头部\n@include not-there.md\n尾部")
 
     assert _loader(project, home).load() == "头部\n\n尾部"
 
@@ -171,7 +171,7 @@ def test_missing_include_is_silent(tmp_path):
 def test_binary_include_skipped(tmp_path):
     """含 \\x00 的文件视为二进制跳过，出现警告注释（F6）。"""
     project, home = _layout(tmp_path)
-    _write(project / "MEWCODE.md", "头部\n@include blob.bin")
+    _write(project / "POTATOCODE.md", "头部\n@include blob.bin")
     (project / "blob.bin").write_bytes(b"BM\x00\x01\x02SECRETBYTES")
 
     text = _loader(project, home).load()
@@ -183,7 +183,7 @@ def test_binary_include_skipped(tmp_path):
 def test_inline_include_not_expanded(tmp_path):
     """出现在段落中间的 @include 不做替换，保持原文（F2）。"""
     project, home = _layout(tmp_path)
-    _write(project / "MEWCODE.md", "请参考 @include rules/style.md 这份文件")
+    _write(project / "POTATOCODE.md", "请参考 @include rules/style.md 这份文件")
     _write(project / "rules" / "style.md", "规则内容")
 
     text = _loader(project, home).load()
@@ -195,7 +195,7 @@ def test_inline_include_not_expanded(tmp_path):
 def test_indented_include_not_expanded(tmp_path):
     """有缩进的 @include 不算独占一行，不展开（F2）。"""
     project, home = _layout(tmp_path)
-    _write(project / "MEWCODE.md", "  @include rules/style.md")
+    _write(project / "POTATOCODE.md", "  @include rules/style.md")
     _write(project / "rules" / "style.md", "规则内容")
 
     assert "规则内容" not in _loader(project, home).load()
@@ -204,8 +204,8 @@ def test_indented_include_not_expanded(tmp_path):
 def test_unreadable_layer_degrades(tmp_path):
     """某一层读取失败（这里是目录占位）时静默跳过，其余层照常加载（N5）。"""
     project, home = _layout(tmp_path)
-    (project / "MEWCODE.md").mkdir()  # 用目录冒充文件，read_bytes 必然失败
-    _write(project / ".potatocode" / "MEWCODE.md", "项目配置级")
+    (project / "POTATOCODE.md").mkdir()  # 用目录冒充文件，read_bytes 必然失败
+    _write(project / ".potatocode" / "POTATOCODE.md", "项目配置级")
 
     assert _loader(project, home).load() == "项目配置级"
 

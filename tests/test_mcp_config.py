@@ -30,7 +30,7 @@ def test_two_layers_merge_and_project_fully_overrides(monkeypatch, tmp_path):
     root = tmp_path / "root"
     _use_home(monkeypatch, home)
     _write(
-        home / ".potatocode/config.yaml",
+        home / ".potatocode" / "mcp_servers.yaml",
         """
 mcp_servers:
   user-only:
@@ -43,7 +43,7 @@ mcp_servers:
 """,
     )
     _write(
-        root / ".potatocode.yaml",
+        root / ".potatocode" / "mcp_servers.yaml",
         """
 mcp_servers:
   project-only:
@@ -67,9 +67,9 @@ def test_invalid_layer_warns_without_hiding_other_layer(monkeypatch, tmp_path, p
     home = tmp_path / "home"
     root = tmp_path / "root"
     _use_home(monkeypatch, home)
-    _write(home / ".potatocode/config.yaml", "mcp_servers: [broken\n")
+    _write(home / ".potatocode" / "mcp_servers.yaml", "mcp_servers: [broken\n")
     _write(
-        root / ".potatocode.yaml",
+        root / ".potatocode" / "mcp_servers.yaml",
         "mcp_servers:\n  good:\n    type: stdio\n    command: python\n",
     )
 
@@ -87,7 +87,7 @@ def test_environment_expands_only_env_and_headers(monkeypatch, tmp_path, pkg_log
     monkeypatch.setenv("KNOWN_TOKEN", "secret-from-host")
     monkeypatch.delenv("MISSING_TOKEN", raising=False)
     _write(
-        root / ".potatocode.yaml",
+        root / ".potatocode" / "mcp_servers.yaml",
         """
 mcp_servers:
   ${SERVER_NAME}:
@@ -120,7 +120,7 @@ def test_invalid_servers_are_skipped_independently(monkeypatch, tmp_path, pkg_lo
     root = tmp_path / "root"
     _use_home(monkeypatch, home)
     _write(
-        root / ".potatocode.yaml",
+        root / ".potatocode" / "mcp_servers.yaml",
         """
 mcp_servers:
   missing-type: {command: python}
@@ -145,8 +145,8 @@ def test_invalid_document_shapes_degrade(monkeypatch, tmp_path, pkg_logs):
     home = tmp_path / "home"
     root = tmp_path / "root"
     _use_home(monkeypatch, home)
-    _write(home / ".potatocode/config.yaml", "- not\n- a\n- mapping\n")
-    _write(root / ".potatocode.yaml", "mcp_servers: nope\n")
+    _write(home / ".potatocode" / "mcp_servers.yaml", "- not\n- a\n- mapping\n")
+    _write(root / ".potatocode" / "mcp_servers.yaml", "mcp_servers: nope\n")
 
     assert load_config(str(root)).servers == {}
     assert pkg_logs.text().count("must be a mapping") == 2
@@ -159,6 +159,6 @@ def test_documented_example_parses(monkeypatch, tmp_path):
     monkeypatch.setenv("GITHUB_TOKEN", "test-token")
     monkeypatch.setenv("EXAMPLE_TOKEN", "test-token")
     example = Path(__file__).parents[1] / "docs/mcp/mcp-servers.example.yaml"
-    _write(root / ".potatocode.yaml", example.read_text(encoding="utf-8"))
+    _write(root / ".potatocode" / "mcp_servers.yaml", example.read_text(encoding="utf-8"))
 
     assert set(load_config(str(root)).servers) == {"github", "local-sqlite", "example-http"}
