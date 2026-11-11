@@ -135,6 +135,44 @@ def test_gather_environment_in_git_repo():
     assert env.git_status in ("干净",) or env.git_status.endswith("个文件改动")
 
 
+# ────────── git 状态外调的解码健壮性（回归：Windows GBK 解码失败） ──────────
+
+
+class _FakeCompletedProcess:
+    """替身：模拟 subprocess.run 的返回值（只关心 returncode/stdout）。"""
+
+    def __init__(self, returncode: int, stdout: bytes | None) -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+def test_git_status_decodes_utf8_output(monkeypatch):
+    """git 输出 UTF-8 中文文件名时应正常统计行数，不做本地编码解码。"""
+    from potatocode.prompt import environment
+
+    fake = _FakeCompletedProcess(0, "?? 中文.txt\n?? README.md\n".encode("utf-8"))
+    monkeypatch.setattr(environment.subprocess, "run", lambda *a, **k: fake)
+    assert environment._collect_git_status() == "2 个文件改动"
+
+
+def test_git_status_degrades_when_stdout_missing(monkeypatch):
+    """stdout 为 None（读取线程解码失败等）时降级为空串，不抛 AttributeError。"""
+    from potatocode.prompt import environment
+
+    fake = _FakeCompletedProcess(0, None)
+    monkeypatch.setattr(environment.subprocess, "run", lambda *a, **k: fake)
+    assert environment._collect_git_status() == ""
+
+
+def test_git_status_degrades_on_nonzero_exit(monkeypatch):
+    """非 git 目录（退出码非零）时降级为空串。"""
+    from potatocode.prompt import environment
+
+    fake = _FakeCompletedProcess(128, b"fatal: not a git repository\n")
+    monkeypatch.setattr(environment.subprocess, "run", lambda *a, **k: fake)
+    assert environment._collect_git_status() == ""
+
+
 # ────────── 补充消息与规划提醒（AC8/F6/F7） ──────────
 
 

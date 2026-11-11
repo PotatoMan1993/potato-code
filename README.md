@@ -67,12 +67,32 @@ providers:
 
 配置了多个 provider 时，启动后会先进入选择界面；只有一个时直接进入对话。
 
+配置文件的查找顺序（第一个存在的生效）：
+
+1. 环境变量 `POTATOCODE_CONFIG_PATH` 指向的路径（最高优先级，便于临时切换）
+2. 当前工作目录下的 `.potatocode/config.yaml`（项目级）
+3. 用户主目录下的 `.potatocode/config.yaml`（用户级，跨项目复用同一份密钥）
+
+所以想让 PotatoCode 在任何项目里都能启动，只需把配置放到 `~/.potatocode/config.yaml`：
+
+```bash
+mkdir -p ~/.potatocode
+cp .potatocode/config.yaml.example ~/.potatocode/config.yaml
+# 编辑 ~/.potatocode/config.yaml 填入真实密钥
+```
+
 ### 运行
 
 ```bash
 uv run potatocode
 # 或（已 pip install -e .）
 python -m potatocode
+```
+
+想在任意目录直接输入 `potatocode`，把它装成全局命令：
+
+```bash
+uv tool install --editable /path/to/potato-code
 ```
 
 ### 验证

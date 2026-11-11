@@ -39,9 +39,6 @@ from .tui import PotatoCodeApp
 
 logger = logging.getLogger(__name__)
 
-# 运行期配置文件路径（含真实密钥，已被 .gitignore 忽略）
-CONFIG_PATH = ".potatocode/config.yaml"
-
 # 会话保留期：超过即由启动时的后台清理任务删除
 SESSION_MAX_AGE = timedelta(days=30)
 
@@ -69,12 +66,14 @@ async def _run(root: str, ses_ctx: SessionContext) -> int:
     会话沿用启动时建好的那一份，使日志文件、JSONL 存档、工具结果落盘同处一个会话目录。
     """
     try:
-        cfg = config.load(CONFIG_PATH)
+        # 三级查找：环境变量 → 项目级 .potatocode/config.yaml → ~/.potatocode/config.yaml
+        cfg = config.load_for_workspace(root)
     except ConfigError as e:
         # N4：可读错误提示，而非崩溃堆栈；同时留一条日志便于事后追溯（F2）
         logger.error("配置错误: %s", e)
         print(f"配置错误: {e}", file=sys.stderr)
         return 1
+    logger.info("配置来源: %s（%d 个 provider）", cfg.source_path, len(cfg.providers))
 
     # 项目指令与长期记忆：进程启动时各加载一次，之后按需注入系统提示（ch11 F8/F32）
     instruction_text = instructions.Loader(root).load()

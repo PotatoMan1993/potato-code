@@ -35,6 +35,8 @@ class Config:
     providers: list[ProviderConfig] = field(default_factory=list)
     # ch15 N6：False 时所有 SubAgent 强制前台同步（超时切后台 / Fork 均失效）；None 视为 True
     enable_subagent_background: bool | None = None
+    # 实际加载的来源文件路径；由 load_for_workspace 回填，便于日志追溯（直接 load 时为 None）
+    source_path: Path | None = None
 
     def effective_enable_subagent_background(self) -> bool:
         """后台能力是否可用：未配置默认开启（ch15 N6）。"""

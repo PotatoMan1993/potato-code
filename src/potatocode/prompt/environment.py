@@ -48,19 +48,23 @@ def _collect_git_status() -> str:
     """用一条 `git status --porcelain` 获取摘要；失败/非 git 目录返回空串。
 
     返回码非零、命令不存在、超时、OSError 一律降级为空串（N4）；不读环境变量（N5）。
+
+    刻意不传 `text=True`：Windows 上本地编码多为 GBK，而 git 输出的是 UTF-8，
+    解码失败会让 subprocess 的读取线程抛异常、`proc.stdout` 直接变成 None，
+    随后 `.strip()` 触发 `AttributeError`（整轮对话被打断）。这里改为自己按
+    UTF-8 容错解码，并显式判空，做到「拿不到就留空」而不影响主流程。
     """
     try:
         proc = subprocess.run(
             ["git", "status", "--porcelain"],
             capture_output=True,
-            text=True,
             timeout=_GIT_TIMEOUT,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return ""
-    if proc.returncode != 0:
+    if proc.returncode != 0 or not proc.stdout:  # stdout 为 None/empty：无可用输出
         return ""
-    out = proc.stdout.strip()
+    out = proc.stdout.decode("utf-8", errors="replace").strip()
     if not out:
         return "干净"
     return f"{len(out.splitlines())} 个文件改动"

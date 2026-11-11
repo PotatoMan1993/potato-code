@@ -3,9 +3,9 @@
 用法：
     python examples/smoke.py [消息1 [消息2 ...]]
 
-从 `.potatocode/config.yaml` 取第一个 provider，同一会话依次发送每条消息；
-每条消息打印该轮 token 用量（含缓存写/读）。连发两条消息可观察次轮 `cache_read > 0`
-（Anthropic 稳定前缀命中），据此验证缓存策略真实生效（F4/AC4）。
+从 `.potatocode/config.yaml` 取第一个 provider（按环境变量 / 项目级 / 用户级三级查找），
+同一会话依次发送每条消息；每条消息打印该轮 token 用量（含缓存写/读）。连发两条消息可观察
+次轮 `cache_read > 0`（Anthropic 稳定前缀命中），据此验证缓存策略真实生效（F4/AC4）。
 """
 
 from __future__ import annotations
@@ -20,8 +20,6 @@ from potatocode.conversation import Conversation
 from potatocode.llm import new_provider
 from potatocode.permission import Mode, new_engine
 from potatocode.tool import new_default_registry
-
-CONFIG_PATH = ".potatocode/config.yaml"
 
 
 async def run_turn(agent: Agent, conv: Conversation, msg: str) -> None:
@@ -51,7 +49,7 @@ async def run_turn(agent: Agent, conv: Conversation, msg: str) -> None:
 
 
 async def main() -> None:
-    cfg = config.load(CONFIG_PATH)
+    cfg = config.load_for_workspace(Path.cwd())
     provider = new_provider(cfg.providers[0])
     registry = new_default_registry()
     # 非交互：以 BYPASS 运行（黑名单/沙箱仍在），避免阻塞在人在回路 Ask
